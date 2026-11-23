@@ -1,32 +1,62 @@
 {
   "manifest_version": 3,
-  "name": "My IT Process to LMX",
-  "version": "1.0.71",
-  "description": "A migration utility for Chromium-based browsers that migrates assessment templates and their responses from My IT Process into Lifecycle Manager X.",
+  "name": "ScalePad Migration Utility",
+  "version": "1.0.73",
+  "description": "A browser-side workspace for migrating data from other platforms into ScalePad products.",
   "action": {
-    "default_popup": "src/popup.html",
-    "default_title": "My IT Process to LMX"
+    "default_title": "Open ScalePad Migration Utility"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel.html"
   },
   "background": {
     "service_worker": "src/background.js"
   },
-  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "webNavigation"
+  ],
   "host_permissions": [
     "https://new.live.myitprocess.com/*",
     "https://api.scalepad.com/*"
   ],
+  "optional_host_permissions": [
+    "https://*.strategyoverview.com/*",
+    "https://*.propelyourmsp.com/*",
+    "https://*.vciotoolbox.com/*",
+    "https://*.quosalsell.com/*"
+  ],
   "content_scripts": [
     {
       "matches": [
-        "https://new.live.myitprocess.com/alignment*"
+        "https://new.live.myitprocess.com/*"
       ],
-      "js": ["src/mapping.js", "src/content-script.js"],
+      "js": [
+        "src/sidepanel-context.js"
+      ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.us.strategyoverview.com/*"
+      ],
+      "js": [
+        "src/so-auth-hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data: https:;"
   }
 }

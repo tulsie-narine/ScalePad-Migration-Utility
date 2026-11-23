@@ -1,3 +1,10 @@
 .claude/
 .DS_Store
 node_modules/
+
+# Local secrets (Propel Reporting DB connection string, etc.)
+.env
+.env.*
+
+# Marketing/sales videos (internal; share outside the repo)
+media/

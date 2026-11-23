@@ -1,56 +1,38 @@
-importScripts('mapping.js', 'so-template-data.js');
+importScripts('propel.js', 'myitp.js', 'so.js');
 
 const API_BASE = 'https://api.scalepad.com';
 const LMX_REQUEST_TIMEOUT_MS = 30000;
 const LMX_RETRY_DELAYS_MS = [500, 1200];
-const REVIEW_TAB_TIMEOUT_MS = 30000;
-const QUESTION_EXTRACTION_TIMEOUT_MS = 180000;
+
+async function configurePrimarySidePanel() {
+  if (!chrome.sidePanel?.setPanelBehavior) return;
+  try {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  } catch (error) {
+    console.warn('Could not make the ScalePad CS side panel the primary action:', error);
+  }
+}
+
+configurePrimarySidePanel();
+chrome.runtime.onInstalled.addListener(configurePrimarySidePanel);
+chrome.runtime.onStartup.addListener(configurePrimarySidePanel);
 
 function timeoutError(label, milliseconds) {
   return new Error(`${label} timed out after ${Math.round(milliseconds / 1000)} seconds.`);
 }
 
 function reportMigrationProgress(message) {
-  chrome.runtime.sendMessage({ type: 'MIGRATION_PROGRESS', message }).catch(() => {});
-}
-
-function simplifyRepeatedName(value) {
-  const text = String(value || '').replace(/\s+/g, ' ').trim();
-  const words = text.split(' ');
-  for (let size = Math.floor(words.length / 2); size >= 1; size--) {
-    const first = words.slice(0, size).join(' ');
-    const second = words.slice(size, size * 2).join(' ');
-    const remainder = words.slice(size * 2).join(' ');
-    if (first && first.toLowerCase() === second.toLowerCase() && /\b(?:onboarding|review|assessment)\b/i.test(remainder)) return first;
-  }
-  if (words.length % 2 === 0) {
-    const midpoint = words.length / 2;
-    const first = words.slice(0, midpoint).join(' ');
-    const second = words.slice(midpoint).join(' ');
-    if (first.toLowerCase() === second.toLowerCase()) return first;
-  }
-  return text;
-}
-
-function truncateApiTitle(value, maxLength = 100) {
-  const text = String(value || '').replace(/\s+/g, ' ').trim();
-  return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 1)).trim()}…`;
+  // No live log listens any more (the old pop-up progress page is gone); keep retries visible in the worker console.
+  console.debug(message);
 }
 
 // ---------- storage helpers ----------
 
 async function getConfig() {
-  const { apiKey, clientMappings, evaluateUserId, soTemplateId, alignmentTemplateId, alignmentTemplateFingerprint, alignmentMigrations } = await chrome.storage.local.get([
-    'apiKey', 'clientMappings', 'evaluateUserId', 'soTemplateId', 'alignmentTemplateId', 'alignmentTemplateFingerprint', 'alignmentMigrations',
-  ]);
+  const { apiKey, evaluateUserId } = await chrome.storage.local.get(['apiKey', 'evaluateUserId']);
   return {
     apiKey: apiKey || null,
-    clientMappings: clientMappings || {},
     evaluateUserId: evaluateUserId || null,
-    soTemplateId: soTemplateId || null,
-    alignmentTemplateId: alignmentTemplateId || null,
-    alignmentTemplateFingerprint: alignmentTemplateFingerprint || null,
-    alignmentMigrations: alignmentMigrations || {},
     extensionVersion: chrome.runtime.getManifest().version,
   };
 }
@@ -63,26 +45,9 @@ async function setEvaluateUser(evaluateUserId) {
   await chrome.storage.local.set({ evaluateUserId });
 }
 
-async function setSoTemplateId(soTemplateId) {
-  await chrome.storage.local.set({ soTemplateId });
-}
-
-async function saveClientMapping(soClientName, lmxClient) {
-  const { clientMappings } = await getConfig();
-  clientMappings[soClientName] = lmxClient; // { id, label }
-  await chrome.storage.local.set({ clientMappings });
-}
-
-async function clearClientMapping(soClientName) {
-  const { clientMappings } = await getConfig();
-  delete clientMappings[soClientName];
-  await chrome.storage.local.set({ clientMappings });
-}
-
-// ---------- LMX API wrapper ----------
-
 function shouldRetryLmx(method, error) {
-  if (method !== 'GET') return false;
+  // GET/PUT/PATCH/DELETE are idempotent, so a retry can't duplicate anything. POST never retries.
+  if (method === 'POST') return false;
   const message = error?.message || String(error);
   return error?.retryable === true || /-> (429|500|502|503|504):/.test(message) || /timed out|network|fetch failed/i.test(message);
 }
@@ -143,6 +108,25 @@ const lmx = {
   listTemplates: () => lmxFetch('/lifecycle-manager/v1/assessment-templates'),
   getTemplate: (id) => lmxFetch(`/lifecycle-manager/v1/assessment-templates/${id}`),
   createTemplate: (body) => lmxFetch('/lifecycle-manager/v1/assessment-templates', { method: 'POST', body }),
+  setQuestionPublicComment: (id, questionId, text) =>
+    lmxFetch(`/lifecycle-manager/v1/assessments/${id}/questions/${questionId}/comment/public`, {
+      method: 'PUT', body: { comment_plain_text: text },
+    }),
+  // Initiative endpoints are documented under /cs/v1 (verified for templates; initiatives verified in the live test).
+  createInitiative: (body) => lmxFetch('/cs/v1/initiatives', { method: 'POST', body }),
+  applyInitiativeTemplate: (id, templateId) => lmxFetch(`/cs/v1/initiatives/${id}/template/${templateId}/apply`, { method: 'POST' }),
+  setInitiativeBudget: (id, items) => lmxFetch(`/cs/v1/initiatives/${id}/budget`, { method: 'PUT', body: { budget_line_items: items } }),
+  setInitiativeRecurring: (id, items) => lmxFetch(`/cs/v1/initiatives/${id}/recurring`, { method: 'PUT', body: { recurring_line_items: items } }),
+  setInitiativeSchedule: (id, body) => lmxFetch(`/cs/v1/initiatives/${id}/schedule`, { method: 'PUT', body: clampSchedule(body).body }),
+  setInitiativeStatus: (id, status) => lmxFetch(`/cs/v1/initiatives/${id}/status`, { method: 'PUT', body: { status } }),
+  setInitiativeAssignedUser: (id, userId) => lmxFetch(`/cs/v1/initiatives/${id}/assigned-user`, { method: 'PUT', body: { assigned_user_id: userId } }),
+  setInitiativePriority: (id, priority) => lmxFetch(`/cs/v1/initiatives/${id}/priority`, { method: 'PUT', body: { priority } }),
+  linkQuestionInitiative: (assessmentId, questionId, initiativeId) =>
+    lmxFetch(`/cs/v1/assessments/${assessmentId}/questions/${questionId}/initiative`, { method: 'POST', body: { initiative_id: initiativeId } }),
+  listInitiativeTemplatesPage: (cursor) => lmxFetch(`/lifecycle-manager/v1/initiative-templates?page_size=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
+  createInitiativeTemplate: (body) => lmxFetch('/lifecycle-manager/v1/initiative-templates', { method: 'POST', body }),
+  listInitiativeTags: () => lmxFetch('/app/v1/tags?filter%5Bdomain%5D=eq%3AInitiative'),
+  createTag: (body) => lmxFetch('/app/v1/tags', { method: 'POST', body }),
   updateTemplate: (id, body) => lmxFetch(`/lifecycle-manager/v1/assessment-templates/${id}`, { method: 'PUT', body }),
   listAssessments: (pageSize = 50) => lmxFetch(`/lifecycle-manager/v1/assessments?page_size=${pageSize}`),
   createAssessment: (body) => lmxFetch('/lifecycle-manager/v1/assessments', { method: 'POST', body }),
@@ -184,879 +168,999 @@ async function recentEvaluators() {
   return (list.data || []).filter((user) => user.status !== 'Disabled');
 }
 
-async function verifyAlignmentMigrations() {
-  const config = await getConfig();
-  const migrations = { ...(config.alignmentMigrations || {}) };
-  let changed = false;
-  for (const [reviewId, migration] of Object.entries(migrations)) {
-    if (!migration.assessmentId) continue;
-    try {
-      const assessment = await lmx.getAssessment(migration.assessmentId);
-      const clientLabel = assessment.assessment?.client?.label;
-      migration.status = migration.status || 'completed';
-      migration.lastVerifiedAt = new Date().toISOString();
-      if (clientLabel && migration.lmxClientLabel !== clientLabel) {
-        migration.lmxClientLabel = clientLabel;
-        changed = true;
-      }
-    } catch (error) {
-      const message = error.message || String(error);
-      if (/404|NOT_FOUND|not found/i.test(message)) {
-        delete migrations[reviewId];
-        changed = true;
-      }
-    }
-  }
-  if (changed) await chrome.storage.local.set({ alignmentMigrations: migrations });
-  return migrations;
+// ---------- side panel prototype state ----------
+
+const SIDE_PANEL_STATE_KEY = 'sidePanelStateByTab';
+const sidePanelStore = () => chrome.storage.session || chrome.storage.local;
+
+function sidePanelTabId(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : null;
 }
 
-async function deleteAlignmentMigration(reviewId, assessmentId) {
-  // Lifecycle Manager's public API does not expose DELETE for assessments.
-  // This operation releases the extension's local migration lock only; the
-  // remote assessment must be removed from the LMX UI if it should be deleted.
-  const config = await getConfig();
-  const migrations = { ...(config.alignmentMigrations || {}) };
-  delete migrations[reviewId];
-  await chrome.storage.local.set({ alignmentMigrations: migrations });
-  return migrations;
-}
-
-async function saveAlignmentMigration(reviewId, patch) {
-  const config = await getConfig();
-  const migrations = { ...(config.alignmentMigrations || {}) };
-  migrations[reviewId] = { ...(migrations[reviewId] || {}), ...patch, updatedAt: new Date().toISOString() };
-  await chrome.storage.local.set({ alignmentMigrations: migrations });
-  return migrations[reviewId];
-}
-
-// The same fixed 4-value criterion set on every question - LMX's "MultiResponse" criterion
-// type is restricted server-side to these exact label_enum values (verified live; the docs'
-// claim that custom label_enum strings are accepted is wrong - arbitrary values 500'd).
-const STANDARD_CRITERIA = [
-  { label_enum: 'Satisfactory', description: 'Healthy / up to standard.' },
-  { label_enum: 'NeedsAttention', description: 'Minor risk - not fully aligned with standards, or a healthy item with a proactive upgrade in progress.' },
-  { label_enum: 'AtRisk', description: 'Identified risk / liability, or currently at risk while a remediation is in progress.' },
-  { label_enum: 'NotApplicable', description: 'Not applicable to this business. Excluded from scoring.' },
-];
-
-/**
- * Build the POST /assessment-templates body that mirrors SO_TEMPLATE_DATA 1:1:
- * one LMX category per SO group, one LMX question per SO item.
- */
-function buildSOTemplatePayload() {
+function newSidePanelState(tabId) {
   return {
-    assessment_template: {
-      title: 'My IT Process - Technology Assessment (mirrored)',
-      description: 'Auto-generated to mirror this account\'s My IT Process assessment structure for migrating assessment templates and responses into Lifecycle Manager X 1:1.',
-      is_category_weight_evenly_distributed: true,
-      categories: self.SO_TEMPLATE_DATA.map((group) => ({
-        title: group.group,
-        description: group.description || null,
-        is_question_weight_evenly_distributed: true,
-        weight_in_percentage: null,
-        questions: group.items.map((item) => ({
-          title: item.name,
-          description: item.description || item.healthStandard || item.name,
-          remediation_tips: item.solutionOptions || null,
-          criterion_label_type_enum: 'MultiResponse',
-          scoring_instructions: item.healthStandard || null,
-          weight_in_percentage: null,
-          tag_ids: [],
-          criteria: STANDARD_CRITERIA,
-        })),
-      })),
-    },
+    workspaceId: 'tab-' + tabId,
+    context: null,
+    events: [],
+    notes: [],
+    followUp: false,
   };
 }
 
-async function createSOTemplate() {
-  const payload = buildSOTemplatePayload();
-  const result = await lmx.createTemplate(payload);
-  await setSoTemplateId(result.assessment_template_id);
-  return result.assessment_template_id;
+async function readSidePanelStates() {
+  const stored = await sidePanelStore().get(SIDE_PANEL_STATE_KEY);
+  return stored[SIDE_PANEL_STATE_KEY] || {};
 }
 
-const ALIGNMENT_TEMPLATE_TITLE = 'My IT Process - Alignment (mirrored)';
-const ALIGNMENT_TEMPLATE_SCHEMA_VERSION = 'alignment-v2-myitp-labels';
-const ALIGNMENT_CRITERIA = [
-  { label_enum: 'Satisfactory', description: 'The Alignment item is satisfied.' },
-  { label_enum: 'NeedsAttention', description: 'The Alignment item is marginal or needs attention.' },
-  { label_enum: 'AtRisk', description: 'The Alignment item is not satisfied.' },
-  { label_enum: 'NotApplicable', description: 'The Alignment item does not apply.' },
-];
+async function getSidePanelState(tabId) {
+  const normalizedTabId = sidePanelTabId(tabId);
+  if (normalizedTabId === null) return newSidePanelState('unavailable');
+  const states = await readSidePanelStates();
+  if (!states[normalizedTabId]) {
+    states[normalizedTabId] = newSidePanelState(normalizedTabId);
+    await sidePanelStore().set({ [SIDE_PANEL_STATE_KEY]: states });
+  }
+  return states[normalizedTabId];
+}
 
-const MYITP_ALIGNMENT_CRITERIA = [
-  { label_enum: 'Aligned', description: 'The Alignment item is satisfied.' },
-  { label_enum: 'Marginal', description: 'The Alignment item is marginal or needs attention.' },
-  { label_enum: 'Vulnerable', description: 'The Alignment item is not satisfied.' },
-  { label_enum: 'N/A', description: 'The Alignment item does not apply.' },
-];
+async function saveSidePanelState(tabId, nextState) {
+  const normalizedTabId = sidePanelTabId(tabId);
+  if (normalizedTabId === null) return nextState;
+  const states = await readSidePanelStates();
+  states[normalizedTabId] = nextState;
+  await sidePanelStore().set({ [SIDE_PANEL_STATE_KEY]: states });
+  return nextState;
+}
 
-const ALIGNMENT_CRITERION_ALIASES = {
-  Satisfactory: ['satisfactory', 'aligned', 'align'],
-  NeedsAttention: ['needsattention', 'needs attention', 'marginal'],
-  AtRisk: ['atrisk', 'at risk', 'vulnerable'],
-  NotApplicable: ['notapplicable', 'not applicable', 'n/a', 'na'],
+async function emitSidePanelState(tabId) {
+  const data = await getSidePanelState(tabId);
+  chrome.runtime.sendMessage({ type: 'SIDE_PANEL_CONTEXT_UPDATED', tabId: sidePanelTabId(tabId), data }).catch(() => {});
+  return data;
+}
+
+function pageContextFromDocument() {
+  const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+    .map((heading) => clean(heading.textContent))
+    .filter(Boolean)
+    .slice(0, 6);
+  return {
+    reason: 'script-request',
+    url: window.location.href,
+    title: clean(document.title) || window.location.hostname,
+    host: window.location.hostname,
+    path: window.location.pathname + window.location.search + window.location.hash,
+    selection: clean(window.getSelection?.()?.toString()).slice(0, 600),
+    headings,
+    preview: clean(document.body?.innerText).slice(0, 420),
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+async function requestSidePanelPageContext(tabId) {
+  const normalizedTabId = sidePanelTabId(tabId);
+  if (normalizedTabId === null) return null;
+  const contentResponse = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(normalizedTabId, { type: 'SIDE_PANEL_GET_CONTEXT' }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(response || null);
+    });
+  });
+  if (contentResponse?.ok && contentResponse.context) {
+    return contentResponse.context;
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: normalizedTabId },
+      files: ['src/sidepanel-context.js'],
+    });
+    const injectedResponse = await new Promise((resolve) => {
+      chrome.tabs.sendMessage(normalizedTabId, { type: 'SIDE_PANEL_GET_CONTEXT' }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        resolve(response || null);
+      });
+    });
+    if (injectedResponse?.ok && injectedResponse.context) return injectedResponse.context;
+  } catch (_error) {
+    // The current tab may be a restricted page or a domain without access.
+  }
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId: normalizedTabId },
+      func: pageContextFromDocument,
+    });
+    return result?.[0]?.result || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function updateSidePanelPageContext(tabId, context) {
+  const normalizedTabId = sidePanelTabId(tabId);
+  if (normalizedTabId === null || !context) return getSidePanelState(tabId);
+  const current = await getSidePanelState(normalizedTabId);
+  const previousUrl = current.context?.url;
+  const next = {
+    ...current,
+    context,
+  };
+  if (previousUrl && previousUrl !== context.url) {
+    next.events = [
+      ...(current.events || []),
+      {
+        label: 'Page changed',
+        detail: context.title || context.host || context.url,
+        icon: '→',
+        createdAt: new Date().toISOString(),
+      },
+    ].slice(-30);
+  }
+  const saved = await saveSidePanelState(normalizedTabId, next);
+  chrome.runtime.sendMessage({ type: 'SIDE_PANEL_CONTEXT_UPDATED', tabId: normalizedTabId, data: saved }).catch(() => {});
+  return saved;
+}
+
+async function resolveSidePanelTabId(candidate) {
+  const normalized = sidePanelTabId(candidate);
+  if (normalized !== null) return normalized;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return sidePanelTabId(tab?.id);
+}
+
+async function clearSidePanelPageContext(tabId) {
+  const normalizedTabId = sidePanelTabId(tabId);
+  if (normalizedTabId === null) return null;
+  const current = await getSidePanelState(normalizedTabId);
+  const next = { ...current, context: null };
+  const saved = await saveSidePanelState(normalizedTabId, next);
+  chrome.runtime.sendMessage({ type: 'SIDE_PANEL_NAVIGATION', tabId: normalizedTabId, data: saved }).catch(() => {});
+  return saved;
+}
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  const data = await getSidePanelState(tabId);
+  chrome.runtime.sendMessage({ type: 'SIDE_PANEL_ACTIVE_TAB_CHANGED', tabId, data }).catch(() => {});
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') {
+    await clearSidePanelPageContext(tabId);
+    return;
+  }
+  if (changeInfo.status === 'complete') {
+    chrome.runtime.sendMessage({ type: 'SIDE_PANEL_NAVIGATION', tabId }).catch(() => {});
+  }
+});
+
+if (chrome.webNavigation?.onHistoryStateUpdated) {
+  chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+    if (details.frameId !== 0) return;
+    chrome.runtime.sendMessage({ type: 'SIDE_PANEL_NAVIGATION', tabId: details.tabId }).catch(() => {});
+  });
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const states = await readSidePanelStates();
+  if (!states[tabId]) return;
+  delete states[tabId];
+  await sidePanelStore().set({ [SIDE_PANEL_STATE_KEY]: states });
+});
+
+// ---------- initiative tags ----------
+
+const INITIATIVE_TAG_COLORS = ['Info400', 'Primary400', 'Positive400', 'Caution200', 'Secondary200', 'Positive700', 'Primary800', 'Excellent300'];
+
+/** Resolve tag names to Initiative-domain tag ids, creating any that are missing. */
+async function ensureInitiativeTags(names) {
+  const wanted = [...new Set((names || []).map((n) => String(n).trim().slice(0, 100)).filter(Boolean))];
+  if (!wanted.length) return [];
+  const existing = (await lmx.listInitiativeTags())?.data || [];
+  const byName = new Map(existing.map((t) => [t.name.trim().toLowerCase(), t.tag_id]));
+  const ids = [];
+  for (const name of wanted) {
+    let id = byName.get(name.toLowerCase());
+    if (!id) {
+      const color = name.startsWith('Priority: ') ? 'Caution200' : INITIATIVE_TAG_COLORS[byName.size % INITIATIVE_TAG_COLORS.length];
+      // Same-name tags in other domains get the Initiative domain added rather than duplicated.
+      const created = await lmx.createTag({ tag: { name, color, domain: 'Initiative' } });
+      id = created.tag_id;
+      byName.set(name.toLowerCase(), id);
+    }
+    ids.push(id);
+  }
+  return ids;
+}
+
+// ---------- Schedule window ----------
+// ScalePad CS returns HTTP 500 for schedules more than ~12 months in the past (confirmed by probing:
+// the quarter containing "today minus 12 months" is the earliest accepted). Clamp instead of failing.
+
+function earliestQuarter(now = new Date()) {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 12, 1));
+  return { year: d.getUTCFullYear(), quarter: Math.floor(d.getUTCMonth() / 3) + 1 };
+}
+const quarterIndex = (q) => q.year * 4 + (q.quarter - 1);
+
+/** Returns { body, clamped } with any too-early schedule moved to the earliest accepted quarter. */
+function clampSchedule(body) {
+  if (!body) return { body, clamped: false };
+  const min = earliestQuarter();
+  if (body.fiscal_quarter && quarterIndex(body.fiscal_quarter) < quarterIndex(min)) return { body: { fiscal_quarter: min }, clamped: true };
+  if (body.target_start_date) {
+    const minStart = new Date(Date.UTC(min.year, (min.quarter - 1) * 3, 1)).toISOString().slice(0, 10);
+    const start = String(body.target_start_date).slice(0, 10);
+    const end = String(body.target_end_date || '').slice(0, 10);
+    if (end && end < minStart) return { body: { fiscal_quarter: min }, clamped: true };
+    if (start < minStart) return { body: { ...body, target_start_date: minStart }, clamped: true };
+  }
+  return { body, clamped: false };
+}
+
+/** Collapse "Label: LMX API PUT ... -> 403: detail" warnings into one line per failure reason. */
+function collapseWarnings(warnings) {
+  const groups = new Map();
+  const other = [];
+  for (const w of warnings) {
+    const m = String(w).match(/^(.+?): LMX API \S+ \S+ -> (\d{3}):?\s*(.*)$/);
+    if (!m) { other.push(w); continue; }
+    const key = m[2] + '|' + m[3].slice(0, 120);
+    if (!groups.has(key)) groups.set(key, { code: m[2], detail: m[3], labels: [] });
+    groups.get(key).labels.push(m[1].toLowerCase());
+  }
+  const lines = [...groups.values()].map((g) => 'Could not set ' + [...new Set(g.labels)].join(', ') + ' (HTTP ' + g.code + (g.detail ? ': ' + g.detail.slice(0, 140) : '') + ')');
+  return [...lines, ...other];
+}
+
+// ---------- Propel client data migration (one audit / one project per call) ----------
+
+const PROPEL_LEDGER_KEY = 'propelMigrationLedger';
+
+async function propelLedger() {
+  const { [PROPEL_LEDGER_KEY]: ledger } = await chrome.storage.local.get(PROPEL_LEDGER_KEY);
+  return ledger || { audits: {}, projects: {} };
+}
+async function recordPropelLedger(kind, propelId, scalepadId, extra = {}) {
+  const ledger = await propelLedger();
+  ledger[kind][propelId] = { ...(ledger[kind][propelId] || {}), id: scalepadId, at: new Date().toISOString(), ...extra };
+  await chrome.storage.local.set({ [PROPEL_LEDGER_KEY]: ledger });
+}
+
+/** Run a step; collect a warning instead of failing the whole item. */
+async function attempt(warnings, label, fn) {
+  try {
+    const result = await fn();
+    return result == null ? true : result; // many ScalePad writes return 204/empty bodies; null means failure
+  } catch (error) {
+    warnings.push(label + ': ' + error.message);
+    return null;
+  }
+}
+
+async function migratePropelAudit({ audit, answers, client, templateId, evaluatorId }) {
+  const ledger = await propelLedger();
+  const warnings = [];
+  let assessmentId = ledger.audits[audit.id]?.id || null;
+  let instance = null;
+  let repaired = false;
+  const notes = [];
+  if (assessmentId) {
+    const entry = ledger.audits[audit.id];
+    try {
+      instance = (await lmx.getAssessment(assessmentId))?.assessment || null;
+    } catch (_error) {
+      instance = null; // deleted in ScalePad since the last run
+    }
+    if (!instance || instance.assessment_template_is_deleted) {
+      // Gone, or its template was deleted (ScalePad then refuses answers): start a fresh assessment.
+      if (instance) notes.push('Its template was deleted, so a new assessment was created. Remove the old one (' + assessmentId + ') with Client Clean Up if it is no longer needed');
+      delete ledger.audits[audit.id];
+      await chrome.storage.local.set({ [PROPEL_LEDGER_KEY]: ledger });
+      assessmentId = null;
+      instance = null;
+    } else if (!entry.needsRepair && !entry.incomplete) {
+      return { skipped: true, assessmentId, links: [], warnings: [] };
+    } else {
+      repaired = true;
+      // Completed assessments are locked: reopen, fix, then complete again.
+      if (instance.status === 'Completed') await attempt(warnings, 'Reopen', () => lmx.setCompletionStatus(assessmentId, false));
+    }
+  }
+  if (!assessmentId) {
+    const created = await lmx.createAssessment(self.Propel.assessmentCreatePayload(audit, { clientId: client.id, clientName: client.name, templateId, evaluatorId }));
+    assessmentId = created.id;
+    await recordPropelLedger('audits', audit.id, assessmentId); // record first so a retry never duplicates
+    instance = (await lmx.getAssessment(assessmentId))?.assessment || {};
+  }
+  const plan = self.Propel.planAssessment(audit, answers, instance);
+  for (let i = 0; i < plan.evaluations.length; i += 25) {
+    await attempt(warnings, 'Answers ' + (i + 1) + '–' + Math.min(i + 25, plan.evaluations.length), () =>
+      lmx.evaluate(assessmentId, { question_evaluations: plan.evaluations.slice(i, i + 25) }));
+  }
+  for (const c of plan.comments) {
+    await attempt(warnings, c.kind + ' comment', () => (c.kind === 'public'
+      ? lmx.setQuestionPublicComment(assessmentId, c.questionId, c.text)
+      : lmx.setQuestionInternalComment(assessmentId, c.questionId, c.text)));
+  }
+  await attempt(warnings, 'Assessment summary', () => lmx.setAssessmentInternalComment(assessmentId, plan.summary));
+  // In-progress Propel audits stay open in ScalePad so they can be finished there (or re-synced later).
+  if (!audit.incomplete) await attempt(warnings, 'Mark complete', () => lmx.setCompletionStatus(assessmentId, true));
+  else notes.push('Still in progress in ' + (String(audit.id).startsWith('mitp-') ? 'MyITProcess' : 'Propel') + ', so the assessment was left open');
+  await recordPropelLedger('audits', audit.id, assessmentId, { needsRepair: warnings.length > 0, incomplete: !!audit.incomplete });
+  return { assessmentId, repaired, links: plan.links, stats: plan.stats, unmatched: plan.unmatched.length, warnings: [...collapseWarnings(warnings), ...notes] };
+}
+
+/** Set the schedule, falling back to the start quarter if ScalePad rejects the date range. */
+async function setPropelSchedule(initiativeId, schedule, warnings, notes) {
+  if (!schedule) return;
+  if (clampSchedule(schedule.primary).clamped && notes) {
+    const q = earliestQuarter();
+    notes.push({ kind: 'schedule', detail: 'Planned date is earlier than ScalePad CS allows; scheduled for Q' + q.quarter + ' ' + q.year + ' instead' });
+  }
+  try {
+    await lmx.setInitiativeSchedule(initiativeId, schedule.primary);
+  } catch (error) {
+    if (!schedule.fallback) { warnings.push('Schedule: ' + error.message); return; }
+    await attempt(warnings, 'Schedule (quarter fallback)', () => lmx.setInitiativeSchedule(initiativeId, schedule.fallback));
+  }
+}
+
+/** The idempotent setters: safe to re-run on an existing initiative (used for repair on retry). */
+async function applyPropelProjectDetails(initiativeId, plan, warnings) {
+  await attempt(warnings, 'One-time budget', () => lmx.setInitiativeBudget(initiativeId, plan.budgetLineItems));
+  await attempt(warnings, 'Recurring costs', () => lmx.setInitiativeRecurring(initiativeId, plan.recurringLineItems));
+  await setPropelSchedule(initiativeId, plan.schedule, warnings, plan.notes);
+  if (plan.priority) await attempt(warnings, 'Priority', () => lmx.setInitiativePriority(initiativeId, plan.priority));
+  if (plan.status) await attempt(warnings, 'Status', () => lmx.setInitiativeStatus(initiativeId, plan.status));
+  if (plan.assignedUserId) await attempt(warnings, 'Owner', () => lmx.setInitiativeAssignedUser(initiativeId, plan.assignedUserId));
+}
+
+async function migratePropelProject({ project, client, templateIdByName, rich, assignedUserId }) {
+  const ledger = await propelLedger();
+  const warnings = [];
+  const plan = self.Propel.planInitiative(project, {
+    clientId: client.id, clientName: client.name, rich,
+    templateIdByName: new Map(templateIdByName || []),
+  });
+  plan.assignedUserId = assignedUserId || null;
+  let existing = ledger.projects[project.id];
+  if (existing) {
+    // Check it still exists before touching it: a deleted initiative answers every update with 403.
+    const alive = await lmxFetch('/cs/v1/initiatives/' + existing.id).then(() => true).catch((e) => !/-> (404|403)/.test(e.message));
+    if (!alive) {
+      delete ledger.projects[project.id];
+      await chrome.storage.local.set({ [PROPEL_LEDGER_KEY]: ledger });
+      plan.notes.push({ kind: 'recreated', detail: 'The earlier copy was deleted in ScalePad CS, so it was created again' });
+      existing = null;
+    }
+  }
+  if (existing) {
+    const templatePending = plan.templateId && !existing.templateApplied;
+    if (!existing.needsRepair && !templatePending) return { skipped: true, initiativeId: existing.id, notes: [], warnings: [] };
+    // Only items that had problems last time are touched again.
+    if (templatePending) {
+      const ok = await attempt(warnings, 'Apply template', () => lmx.applyInitiativeTemplate(existing.id, plan.templateId));
+      if (ok !== null) await recordPropelLedger('projects', project.id, existing.id, { templateApplied: true });
+    }
+    await applyPropelProjectDetails(existing.id, plan, warnings);
+    await recordPropelLedger('projects', project.id, existing.id, { needsRepair: warnings.length > 0 });
+    return { skipped: true, repaired: true, initiativeId: existing.id, notes: plan.notes, warnings: collapseWarnings(warnings) };
+  }
+  const created = await lmx.createInitiative(plan.create);
+  const initiativeId = created.id;
+  await recordPropelLedger('projects', project.id, initiativeId);
+  // Template first (it replaces budget/recurring/action items), then the project's own numbers win.
+  if (plan.templateId) {
+    const ok = await attempt(warnings, 'Apply template', () => lmx.applyInitiativeTemplate(initiativeId, plan.templateId));
+    if (ok !== null) await recordPropelLedger('projects', project.id, initiativeId, { templateApplied: true });
+  }
+  await applyPropelProjectDetails(initiativeId, plan, warnings);
+  await recordPropelLedger('projects', project.id, initiativeId, { needsRepair: warnings.length > 0 });
+  return { initiativeId, notes: plan.notes, warnings: collapseWarnings(warnings) };
+}
+
+/** Link failed assessment items to the initiatives migrated from their Propel projects. */
+async function linkPropelFindings({ assessmentId, links }) {
+  const ledger = await propelLedger();
+  const warnings = [];
+  let linked = 0;
+  for (const link of links || []) {
+    const initiative = ledger.projects[link.projectId];
+    if (!initiative) continue; // project not migrated (yet)
+    const ok = await attempt(warnings, 'Link finding', () => lmx.linkQuestionInitiative(assessmentId, link.questionId, initiative.id));
+    if (ok !== null) linked++;
+  }
+  return { linked, warnings };
+}
+
+// ---------- Client Clean Up (port of sp-marketplace src/lib/cleanup-api.ts) ----------
+// Deletes Lifecycle Manager records for ONE client, children first. Every listed record is
+// re-checked against the client id before deletion, so an ignored filter can't widen scope.
+
+const CLEANUP_TYPES = ['action-items', 'notes', 'assessments', 'deliverables', 'meetings', 'contracts', 'goals', 'initiatives'];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function recordClientId(rec) {
+  return rec?.client?.id || rec?.client?.client_id || rec?.client_id || rec?.clientId || null;
+}
+function recordId(rec, type) {
+  const singular = type.replace(/s$/, '').replace(/-/g, '_');
+  return rec?.id || rec?.[singular + '_id'] || rec?.[type.replace(/-/g, '_') + '_id'] || null;
+}
+
+async function listAllPages(path) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 500; page++) {
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await lmxFetch(path + sep + 'page_size=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+    out.push(...(res?.data || []));
+    cursor = res?.next_cursor;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+/** List one record type for a client: raw filter → eq: filter → unfiltered scan; always client-guarded. */
+async function listClientRecords(type, clientId) {
+  const base = '/lifecycle-manager/v1/' + type;
+  let records = null;
+  for (const value of [clientId, 'eq:' + clientId]) {
+    try { records = await listAllPages(base + '?filter%5Bclient.id%5D=' + encodeURIComponent(value)); break; } catch (_e) { /* try next form */ }
+  }
+  if (records === null) records = await listAllPages(base);
+  let ids = records.filter((r) => recordClientId(r) === clientId).map((r) => recordId(r, type)).filter(Boolean);
+  if (type === 'action-items' && !ids.length) {
+    // Fallback: action items hang off the client's initiatives and meetings.
+    for (const parent of ['initiatives', 'meetings']) {
+      const parents = await listClientRecords(parent, clientId).catch(() => []);
+      for (const pid of parents) {
+        const res = await lmxFetch('/lifecycle-manager/v1/' + parent + '/' + pid + '/action-items').catch(() => null);
+        ids.push(...(res?.action_item_ids || []));
+      }
+    }
+    ids = [...new Set(ids)];
+  }
+  return ids;
+}
+
+/** DELETE with backoff on 429/5xx (honours the retry hints lmxFetch already applies). */
+async function deleteRecord(type, id) {
+  const delays = [1000, 3000, 8000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await lmxFetchOnce('/lifecycle-manager/v1/' + type + '/' + id, { method: 'DELETE', key: (await getConfig()).apiKey });
+      return;
+    } catch (error) {
+      const retryable = /-> (429|500|502|503|504)/.test(error.message);
+      if (!retryable || attempt >= delays.length) throw error;
+      await sleep(delays[attempt]);
+    }
+  }
+}
+
+async function cleanupPreview({ clientId, types }) {
+  const counts = {};
+  for (const type of (types || CLEANUP_TYPES).filter((t) => CLEANUP_TYPES.includes(t))) {
+    try { counts[type] = (await listClientRecords(type, clientId)).length; } catch (error) { counts[type] = { error: error.message }; }
+  }
+  return counts;
+}
+
+async function cleanupDeleteType({ clientId, type }) {
+  if (!CLEANUP_TYPES.includes(type)) throw new Error('Unknown record type: ' + type);
+  const ids = await listClientRecords(type, clientId);
+  const failures = [];
+  let deleted = 0;
+  for (const id of ids) {
+    try { await deleteRecord(type, id); deleted++; } catch (error) { failures.push({ id, detail: error.message }); }
+    await sleep(120);
+  }
+  return { type, total: ids.length, deleted, failures };
+}
+
+// ---------- Template & tag clean up (account level) ----------
+// Only the account's own items are ever listed: ScalePad-provided templates
+// (scope "Application", or deliverable templates with is_custom=false) are filtered out here.
+
+const TEMPLATE_TYPES = {
+  'assessment-templates': { label: 'Assessment template', list: '/cs/v1/assessment-templates', id: 'assessment_template_id', name: 'title', del: (id) => '/cs/v1/assessment-templates/' + id },
+  'initiative-templates': { label: 'Initiative template', list: '/cs/v1/initiative-templates', id: 'initiative_template_id', name: 'name', del: (id) => '/cs/v1/initiative-templates/' + id },
+  'roadmap-templates': { label: 'Roadmap template', list: '/cs/v1/roadmap-templates', id: 'roadmap_template_id', name: 'name', del: (id) => '/cs/v1/roadmap-templates/' + id },
+  'goal-templates': { label: 'Goal template', list: '/cs/v1/goal-templates', id: 'goal_template_id', name: 'title', del: (id) => '/cs/v1/goal-templates/' + id },
+  'task-templates': { label: 'Task template', list: '/app/v1/task-templates', id: 'task_template_id', name: 'title', del: (id) => '/app/v1/task-templates/' + id },
+  'deliverable-templates': { label: 'Deliverable template', list: '/cs/v1/deliverables/templates', id: 'id', name: 'name', custom: (r) => r.is_custom !== false, del: (id) => '/cs/v1/deliverables/templates/' + id },
+  'agreement-templates': { label: 'Agreement template', list: '/cs/v1/agreement-templates', id: 'agreement_template_id', name: 'title', del: (id) => '/cs/v1/agreement-templates/' + id },
+  tags: { label: 'Tag', list: '/app/v1/tags', id: 'tag_id', name: 'name', detail: (r) => (r.domains || []).join(', '), del: (id) => '/app/v1/tags/' + id },
 };
 
-function canonicalAlignmentCriterion(value) {
-  const normalized = String(value || '').trim().toLowerCase();
-  return Object.entries(ALIGNMENT_CRITERION_ALIASES).find(([, aliases]) => aliases.includes(normalized))?.[0] || null;
-}
-
-function templateHasAlignmentCriteria(template) {
-  const labels = new Set();
-  const visit = (value) => {
-    if (!value || typeof value !== 'object') return;
-    for (const key of ['label_enum', 'label_key', 'display_label']) {
-      const canonical = canonicalAlignmentCriterion(value[key]);
-      if (canonical) labels.add(canonical);
+async function listAccountItems(types) {
+  const out = [];
+  for (const type of types) {
+    const t = TEMPLATE_TYPES[type];
+    if (!t) continue;
+    const rows = [];
+    let cursor = null;
+    for (let page = 0; page < 100; page++) {
+      const sep = t.list.includes('?') ? '&' : '?';
+      const res = await lmxFetch(t.list + (type === 'tags' ? '' : sep + 'page_size=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '')));
+      rows.push(...(Array.isArray(res) ? res : res?.data || []));
+      cursor = res?.next_cursor;
+      if (!cursor || type === 'tags') break;
     }
-    for (const child of Object.values(value)) visit(child);
-  };
-  visit(template);
-  return ALIGNMENT_CRITERIA.every((criterion) => labels.has(criterion.label_enum));
-}
-
-function templateUsesMyItProcessLabels(template) {
-  const labels = new Set();
-  const visit = (value) => {
-    if (!value || typeof value !== 'object') return;
-    for (const key of ['label_enum', 'label_key', 'display_label']) {
-      const normalized = String(value[key] || '').trim().toLowerCase();
-      if (normalized) labels.add(normalized);
+    for (const r of rows) {
+      const isOwn = t.custom ? t.custom(r) : (r.scope ? r.scope === 'Account' : true);
+      if (!isOwn) continue;
+      out.push({ type, label: t.label, id: r[t.id], name: r[t.name] || '(untitled)', detail: t.detail ? t.detail(r) : '' });
     }
-    for (const child of Object.values(value)) visit(child);
-  };
-  visit(template);
-  return ['aligned', 'align'].some((label) => labels.has(label))
-    && labels.has('marginal')
-    && labels.has('vulnerable')
-    && (labels.has('n/a') || labels.has('na'));
-}
-
-function templateMatchesAlignmentGroups(template, groups) {
-  const categories = template?.categories || [];
-  if (categories.length !== groups.length) return false;
-  return groups.every((group) => {
-    const category = categories.find((candidate) => candidate.title === group.title);
-    if (!category || (category.questions || []).length !== group.questions.length) return false;
-    const questionTitles = new Set((category.questions || []).map((question) => question.title));
-    return group.questions.every((question) => questionTitles.has(alignmentItemTitle(question)));
-  });
-}
-
-function alignmentItemTitle(item) {
-  const title = String(item?.title || '').replace(/\s+/g, ' ').trim();
-  const question = String(item?.question || '').replace(/\s+/g, ' ').trim();
-  if (!question || title.includes(question)) return title;
-  return `${title} | ${question}`;
-}
-
-function alignmentStructureFingerprint(groups) {
-  const source = JSON.stringify((groups || []).map((group) => ({
-    title: group.title,
-    questions: group.questions.map((item) => ({ title: item.title, question: item.question })),
-  })));
-  const fingerprintSource = JSON.stringify({
-    schema: ALIGNMENT_TEMPLATE_SCHEMA_VERSION,
-    labels: MYITP_ALIGNMENT_CRITERIA,
-    source,
-  });
-  let hash = 2166136261;
-  for (let index = 0; index < fingerprintSource.length; index++) {
-    hash ^= fingerprintSource.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
   }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return out;
 }
 
-function buildAlignmentTemplatePayload(groups, title = ALIGNMENT_TEMPLATE_TITLE) {
-  return {
-    assessment_template: {
-      title,
-      description: 'Mirrored from the My IT Process Alignment questionnaire.',
-      is_category_weight_evenly_distributed: true,
-      categories: groups.map((group) => ({
-        title: group.title,
-        description: `My IT Process Alignment category: ${group.title}`,
-        is_question_weight_evenly_distributed: true,
-        weight_in_percentage: null,
-        questions: group.questions.map((item) => ({
-          title: alignmentItemTitle(item),
-          description: 'Mirrored from My IT Process Alignment.',
-          remediation_tips: null,
-          criterion_label_type_enum: 'MultiResponse',
-          scoring_instructions: 'Yes or Aligned = Satisfactory; Marginal = Needs Attention; No or Vulnerable = At Risk; N/A = Not Applicable.',
-          weight_in_percentage: null,
-          tag_ids: [],
-          criteria: ALIGNMENT_CRITERIA,
-        })),
-      })),
-    },
-  };
-}
-
-function buildAlignmentTemplateUpdatePayload(template, criteria) {
-  return {
-    assessment_template: {
-      title: template.title,
-      description: template.description || 'Mirrored from the My IT Process Alignment questionnaire.',
-      is_category_weight_evenly_distributed: Boolean(template.is_category_weight_evenly_distributed),
-      categories: (template.categories || []).map((category) => ({
-        assessment_template_category_id: category.assessment_template_category_id,
-        title: category.title,
-        description: category.description || null,
-        is_question_weight_evenly_distributed: Boolean(category.is_question_weight_evenly_distributed),
-        weight_in_percentage: category.weight_in_percentage ?? null,
-        questions: (category.questions || []).map((question) => ({
-          assessment_template_question_id: question.assessment_template_question_id,
-          title: question.title,
-          description: question.description || question.title,
-          remediation_tips: question.remediation_tips || null,
-          criterion_label_type_enum: question.criterion_label_type_enum || 'MultiResponse',
-          criteria: criteria.map((criterion, index) => ({
-            assessment_template_criterion_id: question.criteria?.[index]?.assessment_template_criterion_id || null,
-            // LMX protects the internal enum values. Only update the visible description/value.
-            label_enum: question.criteria?.[index]?.label_enum || criterion.label_enum,
-            description: criterion.description,
-          })),
-          scoring_instructions: question.scoring_instructions || null,
-          weight_in_percentage: question.weight_in_percentage ?? null,
-          tag_ids: (question.tags || []).map((tag) => tag.tag_id).filter(Boolean),
-        })),
-      })),
-    },
-  };
-}
-
-async function applyMyItProcessAlignmentLabels(templateId) {
-  const full = await lmx.getTemplate(templateId);
-  if (!full?.assessment_template) throw new Error('LMX returned no assessment template after creation.');
-  await lmx.updateTemplate(templateId, buildAlignmentTemplateUpdatePayload(full.assessment_template, ALIGNMENT_CRITERIA));
-}
-
-async function applyAlignmentValuesIfSafe(templateId, template, groups, fingerprint) {
-  if (template.is_in_use || templateUsesMyItProcessLabels(template)) return false;
-  await applyMyItProcessAlignmentLabels(templateId);
-  const verified = await lmx.getTemplate(templateId);
-  if (!verified?.assessment_template || !templateMatchesAlignmentGroups(verified.assessment_template, groups)) {
-    throw new Error(`LMX template ${templateId} did not retain its structure after updating values.`);
-  }
-  await chrome.storage.local.set({ alignmentTemplateId: templateId, alignmentTemplateFingerprint: fingerprint });
-  return true;
-}
-
-async function getOrCreateAlignmentTemplate(groups, clientName) {
-  const config = await getConfig();
-  const fingerprint = alignmentStructureFingerprint(groups);
-  let storedTemplate = null;
-  if (config.alignmentTemplateId) {
+async function deleteAccountItems(items) {
+  const results = [];
+  for (const item of items) {
+    const t = TEMPLATE_TYPES[item.type];
+    if (!t) { results.push({ ...item, ok: false, detail: 'Unknown type' }); continue; }
     try {
-      const existing = await lmx.getTemplate(config.alignmentTemplateId);
-      if (existing?.assessment_template && templateHasAlignmentCriteria(existing.assessment_template)
-        && templateMatchesAlignmentGroups(existing.assessment_template, groups)
-        && (!config.alignmentTemplateFingerprint || config.alignmentTemplateFingerprint === fingerprint)) {
-        storedTemplate = existing.assessment_template;
-        if (templateUsesMyItProcessLabels(storedTemplate)) {
-          await chrome.storage.local.set({ alignmentTemplateFingerprint: fingerprint });
-          return config.alignmentTemplateId;
+      const key = (await getConfig()).apiKey;
+      const delays = [1000, 3000];
+      for (let attemptNo = 0; ; attemptNo++) {
+        try { await lmxFetchOnce(t.del(item.id), { method: 'DELETE', key }); break; } catch (error) {
+          if (!/-> (429|503)/.test(error.message) || attemptNo >= delays.length) throw error;
+          await sleep(delays[attemptNo]);
         }
       }
-    } catch (_) { /* stored template was deleted or inaccessible; discover/create below */ }
+      results.push({ ...item, ok: true });
+    } catch (error) {
+      results.push({ ...item, ok: false, detail: error.message.replace(/^LMX API DELETE \S+ -> /, '') });
+    }
+    await sleep(120);
   }
+  return results;
+}
 
-  const templates = await lmx.listTemplates();
-  const listedTemplates = templates.data || [];
-  const fullTemplates = [];
-  for (const candidate of listedTemplates) {
+// ---------- ControlMap → ScalePad CS workstream sync ----------
+// Same account and key: ControlMap lives at /controlmap/v1. Items become LM initiatives named
+// "{code} · title"; the code prefix + a stored fingerprint keep re-syncs idempotent.
+
+const CM_SYNC_KEY = 'controlmapSyncItems';
+const CM_STATUS = { 'not started': 'Proposed', 'in progress': 'InProgress', review: 'InProgress', completed: 'Completed', closed: 'Completed', remediated: 'Completed' };
+const CM_PRIORITY = { critical: 'High', severe: 'High', high: 'High', medium: 'Medium', moderate: 'Medium', low: 'Low' };
+
+async function cmPages(path, pick) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 200; page++) {
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await lmxFetch(path + (cursor ? sep + 'cursor=' + encodeURIComponent(cursor) : ''));
+    const box = pick ? pick(res) : res;
+    out.push(...(box?.data || []));
+    cursor = box?.next_cursor;
+    if (!cursor) break;
+    await sleep(120);
+  }
+  return out;
+}
+
+async function cmPortfolio() {
+  const [health, risks] = await Promise.all([
+    cmPages('/controlmap/v1/clients/health?fields=compliance_score,risk_score,work_progress&page_size=200'),
+    cmPages('/controlmap/v1/clients/risks-summary?page_size=200').catch(() => []),
+  ]);
+  const riskById = new Map(risks.map((r) => [r.client?.id, r.risk_summary]));
+  return health.map((h) => {
+    const rs = h.risk_score || riskById.get(h.client?.id) || {};
+    const br = rs.risk_breakdown || {};
+    return {
+      id: h.client?.id, name: h.client?.name || 'Unnamed client', tenantId: h.client?.tenant_id || null,
+      riskLevel: rs.risk_level || null, severe: br.severe || 0, high: br.high || 0, medium: br.medium || 0, low: br.low || 0,
+      compliance: h.compliance_score?.overall_score ?? null, complianceTrend: h.compliance_score?.trend?.last_30_days ?? null,
+      actionItemsPct: h.work_progress?.action_items?.completion_percentage ?? null,
+    };
+  });
+}
+
+async function cmClientItems(clientId) {
+  // Plain GET lists (same fields as the search endpoint) so transient failures retry automatically.
+  // Risks and action items load independently: one failing never blanks the other.
+  const base = '/controlmap/v1/clients/' + clientId;
+  const [risks, actions] = await Promise.allSettled([
+    cmPages(base + '/risks?page_size=100&sort=-current_risk', (r) => r?.risks),
+    cmPages(base + '/action-items?page_size=200', (r) => r?.action_items),
+  ]);
+  const explain = (label, r) => {
+    const msg = r.reason?.message || String(r.reason);
+    const code = (msg.match(/-> (\d{3})/) || [])[1];
+    return 'Could not load ' + label + ' from ControlMap' + (code ? ' (HTTP ' + code + ')' : '') +
+      (code === '403' ? '. The API turned the request away; this is usually temporary, so try again in a moment.' : ': ' + msg);
+  };
+  const errors = [];
+  if (risks.status === 'rejected') errors.push(explain('risks', risks));
+  if (actions.status === 'rejected') errors.push(explain('action items', actions));
+  return {
+    risks: risks.status === 'fulfilled' ? risks.value : [],
+    actionItems: actions.status === 'fulfilled' ? actions.value : [],
+    error: errors.join(' ') || null,
+  };
+}
+
+function cmQuarter(dateStr, horizonMonths) {
+  const d = dateStr ? new Date(dateStr) : new Date();
+  if (!dateStr || Number.isNaN(d.getTime())) d.setUTCMonth(d.getUTCMonth() + (horizonMonths || 6));
+  return { year: d.getUTCFullYear(), quarter: Math.floor(d.getUTCMonth() / 3) + 1 };
+}
+
+/** Desired initiative state for one ControlMap item. */
+function cmSpec(item, sourceType, horizonMonths) {
+  const code = item.code || (sourceType === 'risks' ? 'RSK-' : 'AI-') + item.id;
+  const title = item.weakness_name || item.name || item.title || 'Untitled';
+  const text = (s) => String(s || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const para = (t) => ({ type: 'paragraph', content: [{ type: 'text', text: t }] });
+  const lines = [
+    text(item.weakness_description || item.description) && 'Description: ' + text(item.weakness_description || item.description),
+    text(item.corrective_action || item.treatment) && (item.corrective_action ? 'Corrective action: ' : 'Treatment: ') + text(item.corrective_action || item.treatment),
+    item.current_risk_label && 'Current risk: ' + item.current_risk_label + (item.target_risk_label ? ' → target ' + item.target_risk_label : ''),
+    'Synced from ControlMap ' + code + '.',
+  ].filter(Boolean).map((t) => t.slice(0, 2000));
+  const status = String(item.status || '').toLowerCase();
+  const cost = Number(item.cost) || 0;
+  return {
+    code,
+    name: (code + ' · ' + title).slice(0, 200),
+    summary: JSON.stringify({ type: 'doc', content: lines.map(para) }),
+    status: CM_STATUS[status] || 'Proposed',
+    priority: CM_PRIORITY[String(item.priority || item.current_risk_label || '').toLowerCase()] || 'None',
+    quarter: cmQuarter(item.planned_completion_date || item.planned_end_date || item.due_date || item.planned_start_date, horizonMonths),
+    budgetLine: cost > 0 ? { label: 'ControlMap ' + code + ' remediation', cost_subunits: Math.round(cost * 100), cost_type: 'Fixed' } : null,
+  };
+}
+
+async function lmClientInitiatives(lmClientId) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 50; page++) {
+    const res = await lmxFetch('/lifecycle-manager/v2/initiatives?filter%5Bclient.id%5D=eq%3A' + encodeURIComponent(lmClientId) + '&include_unscheduled=true&page_size=200' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+    out.push(...(res?.data || []));
+    cursor = res?.next_cursor;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+/**
+ * Sync selected ControlMap items into initiatives for one client.
+ * payload: { cmClientId, lmClient:{id,name}, sourceType:'risks'|'action_items', items:[...], horizonMonths, dryRun }
+ */
+async function cmSync({ cmClientId, lmClient, sourceType, items, horizonMonths = 6, dryRun = true }) {
+  const { [CM_SYNC_KEY]: store = {} } = await chrome.storage.local.get(CM_SYNC_KEY);
+  const existing = await lmClientInitiatives(lmClient.id).catch(() => []);
+  const byCode = new Map(existing.map((i) => [String(i.name || '').split(' · ')[0], i]));
+  const summary = { created: 0, updated: 0, unchanged: 0, skipped: 0, errors: [] };
+  for (const item of items) {
+    if (String(item.status || '').toLowerCase() === 'not applicable') { summary.skipped++; continue; }
+    const spec = cmSpec(item, sourceType, horizonMonths);
+    const key = cmClientId + '|' + sourceType + '|' + item.id;
+    const fingerprint = JSON.stringify(spec);
+    const known = store[key];
+    let initiativeId = known?.initiativeId || byCode.get(spec.code)?.id || byCode.get(spec.code)?.initiative_id || null;
+    if (known && known.fingerprint === fingerprint && initiativeId) { summary.unchanged++; continue; }
+    if (dryRun) { initiativeId ? summary.updated++ : summary.created++; continue; }
+    const warnings = [];
     try {
-      const full = await lmx.getTemplate(candidate.assessment_template_id);
-      if (full?.assessment_template && templateMatchesAlignmentGroups(full.assessment_template, groups)) {
-        fullTemplates.push({ id: candidate.assessment_template_id, template: full.assessment_template });
+      if (initiativeId) {
+        await attempt(warnings, 'Rename/summary', () => lmxFetch('/cs/v1/initiatives/' + initiativeId, { method: 'PATCH', body: { name: spec.name, executive_summary_json: spec.summary } }));
+        summary.updated++;
+      } else {
+        const created = await lmx.createInitiative({ client_key: { id: lmClient.id, name: lmClient.name }, name: spec.name, executive_summary_json: spec.summary });
+        initiativeId = created.id;
+        summary.created++;
       }
-    } catch (_) { /* ignore inaccessible or stale templates */ }
+      store[key] = { initiativeId, fingerprint: null, code: spec.code }; // null until all steps land, so a retry re-applies
+      await attempt(warnings, 'Status', () => lmx.setInitiativeStatus(initiativeId, spec.status));
+      if (spec.priority !== 'None') await attempt(warnings, 'Priority', () => lmx.setInitiativePriority(initiativeId, spec.priority));
+      await attempt(warnings, 'Schedule', () => lmx.setInitiativeSchedule(initiativeId, { fiscal_quarter: spec.quarter }));
+      if (spec.budgetLine) {
+        // Replace only our own labelled line; keep anything the user added.
+        const current = (byCode.get(spec.code)?.budget?.line_items || []).filter((l) => l.label !== spec.budgetLine.label);
+        await attempt(warnings, 'Budget', () => lmx.setInitiativeBudget(initiativeId, [...current, spec.budgetLine]));
+      }
+      if (!warnings.length) store[key].fingerprint = fingerprint;
+      else summary.errors.push(spec.name + ': ' + warnings.join('; '));
+    } catch (error) {
+      summary.errors.push(spec.name + ': ' + error.message);
+    }
+    await chrome.storage.local.set({ [CM_SYNC_KEY]: store });
+    await sleep(120);
   }
+  return summary;
+}
 
-  // Prefer an existing template with the original My IT Process labels.
-  const customMatch = fullTemplates.find(({ template }) => templateUsesMyItProcessLabels(template));
-  if (customMatch) {
-    await chrome.storage.local.set({ alignmentTemplateId: customMatch.id, alignmentTemplateFingerprint: fingerprint });
-    return customMatch.id;
+// ---------- Tenant migration (v1: initiatives, goals, notes, assessments + goal→initiative links) ----------
+// Source key lives only in chrome.storage.session (memory; cleared when the browser closes).
+// Destination = the key configured in Settings. A ledger prevents duplicates on re-runs.
+
+const TENANT_SOURCE_KEY = 'tenantSourceApiKey';
+const TENANT_LEDGER_KEY = 'tenantMigrationLedger';
+
+async function tenantKey(side) {
+  if (side === 'dest') return (await getConfig()).apiKey;
+  const { [TENANT_SOURCE_KEY]: key } = await chrome.storage.session.get(TENANT_SOURCE_KEY);
+  if (!key) throw new Error('Add the source tenant API key first.');
+  return key;
+}
+
+/** Fetch with an explicit tenant key; retries 429/5xx with backoff. */
+async function tenantFetch(side, path, { method = 'GET', body } = {}) {
+  const key = await tenantKey(side);
+  const delays = [800, 2000, 5000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await lmxFetchOnce(path, { method, body, key });
+    } catch (error) {
+      if (!/-> (429|500|502|503|504)/.test(error.message) || attempt >= delays.length || (method !== 'GET' && !/-> 429/.test(error.message))) throw error;
+      await sleep(delays[attempt]);
+    }
   }
+}
 
-  const versionedTitle = `${ALIGNMENT_TEMPLATE_TITLE} [${fingerprint}]`;
-  const standardMatch = fullTemplates.find(({ id, template }) =>
-    templateHasAlignmentCriteria(template) && (template.title === versionedTitle || id === config.alignmentTemplateId
-      || template.title === ALIGNMENT_TEMPLATE_TITLE || template.title.startsWith(`${ALIGNMENT_TEMPLATE_TITLE} [`)));
-  if (standardMatch) {
-    await applyAlignmentValuesIfSafe(standardMatch.id, standardMatch.template, groups, fingerprint);
-    await chrome.storage.local.set({ alignmentTemplateId: standardMatch.id, alignmentTemplateFingerprint: fingerprint });
-    return standardMatch.id;
+async function tenantPages(side, path) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 200; page++) {
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await tenantFetch(side, path + sep + 'page_size=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+    out.push(...(res?.data || []));
+    cursor = res?.next_cursor;
+    if (!cursor) break;
   }
+  return out;
+}
 
-  const clientSuffix = ` [${simplifyRepeatedName(clientName) || 'client'}]`;
-  const title = truncateApiTitle(`${versionedTitle}${clientSuffix}`);
-  const created = await lmx.createTemplate(buildAlignmentTemplatePayload(groups, title));
-  await chrome.storage.local.set({ alignmentTemplateId: created.assessment_template_id, alignmentTemplateFingerprint: fingerprint });
+async function tenantSetSourceKey(apiKey) {
+  const key = String(apiKey || '').trim();
+  if (!key) { await chrome.storage.session.remove(TENANT_SOURCE_KEY); return { cleared: true }; }
+  await lmxFetchOnce('/lifecycle-manager/v1/users?page_size=1', { method: 'GET', key }); // validates the key
+  await chrome.storage.session.set({ [TENANT_SOURCE_KEY]: key });
+  const dest = (await getConfig()).apiKey;
+  return { sameTenant: key === dest };
+}
+
+async function tenantClients(side) {
+  const rows = await tenantPages(side, '/lifecycle-manager/v1/clients?sort=name');
+  return rows.map((r) => ({ id: r.client?.client_id || r.client_id || r.id, name: r.client?.display_name || r.display_name || r.name || '' })).filter((c) => c.id);
+}
+
+async function tenantUsers(side) {
+  const rows = await tenantPages(side, '/lifecycle-manager/v1/users');
+  return rows.map((u) => ({
+    id: u.user_id || u.id,
+    email: (u.email || u.contact_info?.email || '').trim().toLowerCase() || null,
+    name: ((u.first_name || '') + ' ' + (u.last_name || '')).trim() || u.name || u.email || 'Unnamed user',
+    disabled: u.status === 'Disabled',
+  })).filter((u) => u.id);
+}
+
+/**
+ * Pair every source user with a destination user: email first, then an unambiguous full name.
+ * Owners and evaluators that find no pair fall back to the chosen destination user.
+ */
+async function tenantUserMatch() {
+  const [source, dest] = await Promise.all([tenantUsers('source'), tenantUsers('dest')]);
+  const active = dest.filter((u) => !u.disabled);
+  const byEmail = new Map(active.filter((u) => u.email).map((u) => [u.email, u.id]));
+  const norm = (s) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const byName = new Map();
+  for (const u of active) byName.set(norm(u.name), [...(byName.get(norm(u.name)) || []), u.id]);
+  const rows = source.map((u) => {
+    const row = { key: u.id, sourceId: u.id, sourceName: u.name, sourceEmail: u.email, destId: null, matchedBy: 'none' };
+    if (u.email && byEmail.has(u.email)) return { ...row, destId: byEmail.get(u.email), matchedBy: 'email' };
+    const named = byName.get(norm(u.name)) || [];
+    if (named.length === 1) return { ...row, destId: named[0], matchedBy: 'name' };
+    return row;
+  }).sort((a, b) => (!!a.destId - !!b.destId) || a.sourceName.localeCompare(b.sourceName));
+  return { rows, destUsers: active.map(({ id, email, name }) => ({ id, email, name })).sort((a, b) => a.name.localeCompare(b.name)) };
+}
+
+async function tenantLedger() {
+  const { [TENANT_LEDGER_KEY]: l } = await chrome.storage.local.get(TENANT_LEDGER_KEY);
+  return l || {};
+}
+async function tenantRecord(key, dstId) {
+  const l = await tenantLedger();
+  l[key] = dstId;
+  await chrome.storage.local.set({ [TENANT_LEDGER_KEY]: l });
+}
+
+const cleanLines = (lines) => (lines || []).map(({ item_id, product_id, assigned_asset_count, ...rest }) => rest);
+
+async function tenantCopyTemplate(srcTemplateId, destTemplates) {
+  const src = (await tenantFetch('source', '/lifecycle-manager/v1/assessment-templates/' + srcTemplateId))?.assessment_template;
+  if (!src) throw new Error('Source assessment template not found.');
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  const match = destTemplates.find((t) => norm(t.title) === norm(src.title));
+  if (match) return match.assessment_template_id || match.id;
+  const payload = { assessment_template: {
+    title: src.title, description: String(src.description || '').trim() || src.title,
+    is_category_weight_evenly_distributed: !!src.is_category_weight_evenly_distributed,
+    categories: (src.categories || []).map((c) => ({
+      title: c.title, description: c.description || null,
+      is_question_weight_evenly_distributed: !!c.is_question_weight_evenly_distributed,
+      weight_in_percentage: c.weight_in_percentage ?? null,
+      questions: (c.questions || []).map((q) => ({
+        title: q.title, description: String(q.description || '').trim() || q.title, remediation_tips: q.remediation_tips || null,
+        scoring_instructions: q.scoring_instructions || null, criterion_label_type_enum: q.criterion_label_type_enum || 'MultiResponse',
+        weight_in_percentage: q.weight_in_percentage ?? null, tag_ids: [],
+        // The API rejects empty descriptions (422), so blank criteria get their rating label.
+        criteria: (q.criteria || []).map((cr) => {
+          const label = cr.label_enum || cr.label_key;
+          const text = { Satisfactory: 'Satisfactory', NeedsAttention: 'Needs attention', AtRisk: 'At risk', NotApplicable: 'Not applicable' }[label] || label || 'No description';
+          return { label_enum: label, description: String(cr.description || '').trim() || text };
+        }),
+      })),
+    })),
+  } };
+  const created = await tenantFetch('dest', '/lifecycle-manager/v1/assessment-templates', { method: 'POST', body: payload });
+  destTemplates.push({ title: src.title, assessment_template_id: created.assessment_template_id });
   return created.assessment_template_id;
 }
 
-// ---------- migration orchestration ----------
-
 /**
- * Build { [categoryTitle]: { [questionTitle]: { instanceQuestionId, criteriaByLabel } } }
- * from a freshly created/fetched assessment instance.
+ * Migrate one client. payload: { src:{id,name}, dst:{id,name}, objects:{initiatives,goals,notes,assessments}, primaryUserId }
+ * Returns per-type counts, warnings, and errors. Never re-creates anything already in the ledger.
  */
-function indexAssessmentQuestions(assessment) {
-  const byCategory = {};
-  for (const cat of assessment.category_list) {
-    const questions = {};
-    for (const q of cat.question_list) {
-      const criteriaByLabel = {};
-      for (const c of q.criteria_list) {
-        const key = canonicalAlignmentCriterion(c.label_key || c.label_enum || c.display_label);
-        if (key) criteriaByLabel[key] = c.assessment_criterion_id;
-      }
-      questions[q.title] = { instanceQuestionId: q.assessment_question_id, criteriaByLabel };
-    }
-    byCategory[cat.title] = questions;
-  }
-  return byCategory;
-}
-
-function indexAlignmentAssessmentQuestions(assessment) {
-  const byCategory = {};
-  for (const cat of assessment.category_list) {
-    const byTitle = {};
-    for (const q of cat.question_list) {
-      const criteriaByLabel = {};
-      for (const c of q.criteria_list) {
-        const key = canonicalAlignmentCriterion(c.label_key || c.label_enum || c.display_label);
-        if (key) criteriaByLabel[key] = c.assessment_criterion_id;
-      }
-      if (!byTitle[q.title]) byTitle[q.title] = [];
-      byTitle[q.title].push({ instanceQuestionId: q.assessment_question_id, criteriaByLabel });
-    }
-    byCategory[cat.title] = byTitle;
-  }
-  return byCategory;
-}
-
-async function runMigration({ soGroups, soClientName, lmxClientId, lmxClientLabel, templateId, evaluateUserId, markComplete }) {
-  const log = [];
-  const push = (msg) => { log.push(msg); };
-
-  if (!lmxClientId) throw new Error('No LMX client mapped for this My IT Process client yet.');
-  if (!evaluateUserId) throw new Error('No LMX evaluating user selected yet.');
-  if (!templateId) throw new Error('No LMX template selected yet - create the mirrored template first.');
-
-  push('Creating assessment in LMX...');
-  const created = await lmx.createAssessment({
-    client_key: { id: lmxClientId, name: lmxClientLabel },
-    title: truncateApiTitle(`${soClientName} - Migrated from My IT Process`),
-    assessment_template_id: templateId,
-    evaluate_user_id: evaluateUserId,
-    evaluate_at: new Date().toISOString(),
-  });
-  const assessmentId = created.id;
-  push(`Created LMX assessment ${assessmentId}.`);
-
-  const full = await lmx.getAssessment(assessmentId);
-  const byCategory = indexAlignmentAssessmentQuestions(full.assessment);
-  const titleOccurrences = {};
-
-  const questionEvaluations = [];
-  const commentJobs = [];
-  const unmatched = [];
-
-  for (const g of soGroups) {
-    const questions = byCategory[g.group];
-    if (!questions) { unmatched.push(`[group not found in LMX template] ${g.group} (${g.items.length} item(s))`); continue; }
-
-    for (const item of g.items) {
-      const target = questions[item.name];
-      if (!target) { unmatched.push(`[${g.group}] ${item.name} (no matching LMX question - template out of sync?)`); continue; }
-
-      const criterion = self.SO_LMX_MAPPING.gradeKeyToLMXCriterion(item.gradeKey);
-      if (criterion && target.criteriaByLabel[criterion]) {
-        questionEvaluations.push({
-          question_id: target.instanceQuestionId,
-          selected_criteria_id: target.criteriaByLabel[criterion],
-        });
-      }
-      const hasDetail = item.status || item.risk || item.solution || item.budget;
-      if (hasDetail) {
-        commentJobs.push({ questionId: target.instanceQuestionId, text: self.SO_LMX_MAPPING.buildItemComment(item) });
-      }
-    }
-  }
-
-  if (questionEvaluations.length) {
-    push(`Setting ${questionEvaluations.length} question answer(s)...`);
-    try {
-      await lmx.evaluate(assessmentId, { question_evaluations: questionEvaluations });
-    } catch (err) {
-      push(`Warning: setting question answers failed (${err.message}) - continuing to write comments so SO detail isn't lost.`);
-    }
-  }
-
-  push(`Writing ${commentJobs.length} internal comment(s)...`);
-  let commentFailures = 0;
-  for (const job of commentJobs) {
-    try {
-      await lmx.setQuestionInternalComment(assessmentId, job.questionId, job.text);
-    } catch (err) {
-      commentFailures++;
-      push(`  - failed to write comment on question ${job.questionId}: ${err.message}`);
-    }
-  }
-  if (commentFailures) push(`Warning: ${commentFailures} of ${commentJobs.length} comment(s) failed to save (see above) - the rest of the migration continued.`);
-
-  if (unmatched.length) {
-    const text = unmatched.slice(0, 40).join('\n') + (unmatched.length > 40 ? `\n...(+${unmatched.length - 40} more)` : '');
-    try {
-      await lmx.setAssessmentInternalComment(assessmentId, `[Items that could not be matched to this LMX template]\n${text}`.slice(0, 1000));
-      push(`Logged ${unmatched.length} unmatched item(s) as an assessment-level internal comment.`);
-    } catch (err) {
-      push(`Warning: failed to write the assessment-level internal comment: ${err.message}`);
-    }
-  } else {
-    push('Every SO item matched a question in the LMX template.');
-  }
-
-  if (markComplete) {
-    await lmx.setCompletionStatus(assessmentId, true);
-    push('Marked assessment as completed.');
-  }
-
-  return { assessmentId, log };
-}
-
-function alignmentResponseToCriterion(response) {
-  const value = String(response || '').trim().toLowerCase();
-  if (value === 'yes' || value === 'aligned') return 'Satisfactory';
-  if (value === 'marginal' || value === 'needs attention' || value === 'needsattention') return 'NeedsAttention';
-  if (value === 'no' || value === 'vulnerable') return 'AtRisk';
-  if (value === 'n/a' || value === 'na' || value === 'not applicable') return 'NotApplicable';
-  return null;
-}
-
-function groupAlignmentQuestions(questions) {
-  const groups = new Map();
-  for (const item of questions || []) {
-    const title = item.category || 'Alignment';
-    if (!groups.has(title)) groups.set(title, { title, questions: [] });
-    groups.get(title).questions.push(item);
-  }
-  return Array.from(groups.values());
-}
-
-async function runAlignmentMigration({ questions, expectedQuestionCount, clientName, lmxClientId, lmxClientLabel, evaluateUserId, bothComplete, engineerReviewName, vcioReviewName }) {
-  const log = [];
-  const push = (message) => log.push(message);
-  if (!lmxClientId) throw new Error('No LMX client mapped for this My IT Process client yet.');
-  if (!evaluateUserId) throw new Error('No LMX evaluating user selected yet.');
-  if (!questions?.length) throw new Error('No Alignment questions found on this review.');
-  if (expectedQuestionCount && questions.length < expectedQuestionCount) {
-    throw new Error(`Incomplete Alignment extraction: collected ${questions.length} of ${expectedQuestionCount} expected question(s).`);
-  }
-  reportMigrationProgress(`Extracted ${questions.length}/${expectedQuestionCount || questions.length} Alignment question(s).`);
-
-  const groups = groupAlignmentQuestions(questions);
-  reportMigrationProgress(`Checking the mirrored template across ${groups.length} category group(s).`);
-  push(`Checking for the ${ALIGNMENT_TEMPLATE_TITLE} template...`);
-  const normalizedClientName = simplifyRepeatedName(clientName);
-  const templateId = await getOrCreateAlignmentTemplate(groups, normalizedClientName);
-  push(`Using LMX template ${templateId}.`);
-
-  const assessmentTitle = truncateApiTitle(`${normalizedClientName} - My IT Process Alignment`);
-  let existing = (await lmx.listAssessments(100)).data?.find((assessment) =>
-    assessment.title === assessmentTitle && assessment.client?.id === lmxClientId
-  );
-  if (existing) {
-    try {
-      const existingFull = await lmx.getAssessment(existing.id);
-      const existingTemplateId = existingFull.assessment?.assessment_template_id;
-      if (existingTemplateId && existingTemplateId !== templateId) {
-        push(`Existing assessment ${existing.id} uses an older LMX template; creating a new assessment from ${templateId}.`);
-        existing = null;
-      }
-    } catch (_) { /* use the existing assessment if its details cannot be read */ }
-  }
-  let assessmentId;
-  let assessmentCreated = false;
-  if (existing) {
-    assessmentId = existing.id;
-    push(`Reusing existing LMX assessment ${assessmentId}; no duplicate was created.`);
-  } else {
-    const created = await lmx.createAssessment({
-      client_key: { id: lmxClientId, name: lmxClientLabel },
-      title: assessmentTitle,
-      assessment_template_id: templateId,
-      evaluate_user_id: evaluateUserId,
-      evaluate_at: new Date().toISOString(),
-    });
-    assessmentId = created.id;
-    assessmentCreated = true;
-    push(`Created LMX assessment ${assessmentId}.`);
-  }
-  reportMigrationProgress(`Using LMX assessment ${assessmentId}.`);
-
-  const reviewerComment = [
-    engineerReviewName ? `Engineer Review: ${engineerReviewName}` : '',
-    vcioReviewName ? `vCIO Review: ${vcioReviewName}` : '',
-  ].filter(Boolean).join('\n');
-  if (assessmentCreated && reviewerComment) {
-    await lmx.setAssessmentInternalComment(assessmentId, reviewerComment.slice(0, 1000));
-    push('Added Engineer Review and vCIO Review names to the assessment internal comment.');
-  }
-
-  const full = await lmx.getAssessment(assessmentId);
-  const byCategory = indexAlignmentAssessmentQuestions(full.assessment);
-  const titleOccurrences = {};
-  const questionEvaluations = [];
-  const commentJobs = [];
-  const unmatched = [];
-  const unanswered = [];
-  let evaluationFailures = 0;
-  let commentFailures = 0;
-
-  for (const item of questions) {
-    const category = byCategory[item.category || 'Alignment'];
-    const occurrenceKey = `${item.category || 'Alignment'}:${alignmentItemTitle(item)}`;
-    const occurrence = titleOccurrences[occurrenceKey] || 0;
-    const target = category?.[alignmentItemTitle(item)]?.[occurrence];
-    titleOccurrences[occurrenceKey] = occurrence + 1;
-    if (!target) {
-      unmatched.push(`[${item.category || 'Alignment'}] ${item.title}`);
-      continue;
-    }
-    const criterion = alignmentResponseToCriterion(item.engineerResponse || item.response);
-    if (criterion && target.criteriaByLabel[criterion]) {
-      questionEvaluations.push({
-        question_id: target.instanceQuestionId,
-        selected_criteria_id: target.criteriaByLabel[criterion],
-      });
-    } else if (!criterion) {
-      unanswered.push(`[${item.category || 'Alignment'}] ${item.title}`);
-    }
-    const commentLines = [];
-    if (item.alignmentResponse) {
-      commentLines.push(`${item.alignmentPrompt} ${item.alignmentResponse}`);
-    }
-    if (item.technicalAnalysis) {
-      commentLines.push(`Technical Analysis: ${item.technicalAnalysis}`);
-    }
-    if (commentLines.length) {
-      commentJobs.push({
-        questionId: target.instanceQuestionId,
-        text: commentLines.join('\n').slice(0, self.SO_LMX_MAPPING.LMX_COMMENT_MAX_LENGTH),
-      });
-    }
-  }
-
-  const responseSources = questions.reduce((counts, item) => {
-    if (item.response) counts[item.responseSource || 'unknown'] = (counts[item.responseSource || 'unknown'] || 0) + 1;
-    return counts;
-  }, {});
-  push(`Captured source responses: Engineer ${responseSources.engineer || 0}, vCIO ${responseSources.vcio || 0}, other ${responseSources.alignment || 0}.`);
-
-  if (questionEvaluations.length) {
-    push(`Setting ${questionEvaluations.length} question answer(s) from Engineer responses...`);
-    reportMigrationProgress(`Applying ${questionEvaluations.length} response(s) to LMX.`);
-    for (let offset = 0; offset < questionEvaluations.length; offset += 25) {
-      const batch = questionEvaluations.slice(offset, offset + 25);
-      try {
-        await lmx.evaluate(assessmentId, { question_evaluations: batch });
-        push(`Applied answers ${offset + 1}-${offset + batch.length} of ${questionEvaluations.length}.`);
-      } catch (error) {
-        evaluationFailures++;
-        push(`Warning: answer batch ${offset + 1}-${offset + batch.length} failed: ${error.message}`);
-      }
-    }
-    if (evaluationFailures) push(`${evaluationFailures} answer batch(es) failed; the assessment remains retryable.`);
-  }
-  if (unanswered.length) push(`No usable Engineer response for ${unanswered.length} question(s); left those unanswered.`);
-  push(`Writing ${commentJobs.length} source-context note(s) to LMX internal comments...`);
-  reportMigrationProgress(`Writing ${commentJobs.length} source-context comment(s).`);
-  for (const job of commentJobs) {
-    try {
-      await lmx.setQuestionInternalComment(assessmentId, job.questionId, job.text);
-    } catch (error) {
-      commentFailures++;
-      push(`Warning: question comment ${job.questionId} failed: ${error.message}`);
-    }
-  }
-  if (unmatched.length) {
-    const unmatchedComment = `[Items that could not be matched]\n${unmatched.join('\n')}`;
-    await lmx.setAssessmentInternalComment(assessmentId, [reviewerComment, unmatchedComment].filter(Boolean).join('\n\n').slice(0, 1000));
-    push(`Logged ${unmatched.length} unmatched question(s).`);
-  }
-  const migrationComplete = bothComplete && evaluationFailures === 0 && commentFailures === 0 && unmatched.length === 0 && unanswered.length === 0;
-  if (migrationComplete) {
-    await lmx.setCompletionStatus(assessmentId, true);
-    push('Both My IT Process reviews were complete; marked the LMX assessment completed.');
-  } else {
-    push('Assessment created with warnings; left the LMX assessment in progress for follow-up.');
-  }
-  reportMigrationProgress('Migration steps completed; saving migration record.');
-  return {
-    assessmentId,
-    templateId,
-    assessmentCreated,
-    expectedQuestionCount: expectedQuestionCount || questions.length,
-    log,
-    answeredCount: questionEvaluations.length,
-    unmatchedCount: unmatched.length,
-    unansweredCount: unanswered.length,
-    unmatched,
-    unanswered,
-    evaluationFailures,
-    commentFailures,
-    warningCount: unmatched.length + unanswered.length + evaluationFailures + commentFailures,
-    retryable: evaluationFailures > 0 || commentFailures > 0 || unmatched.length > 0,
-    partial: !migrationComplete,
+async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }) {
+  const ledger = await tenantLedger();
+  const out = { counts: {}, warnings: [], errors: [] };
+  const { [TENANT_SOURCE_KEY]: sourceKey } = await chrome.storage.session.get(TENANT_SOURCE_KEY);
+  const sameTenant = sourceKey === (await getConfig()).apiKey;
+  // Source owner/evaluator -> destination user via the reviewed matching; fallback is the chosen user.
+  const resolveUser = (sourceId, sourceEmail, label, recordName) => {
+    if (!sourceId && !sourceEmail) return primaryUserId || null;
+    if (sameTenant && sourceId) return sourceId;
+    const mapped = (sourceId && userMap?.byId?.[sourceId]) || (sourceEmail && userMap?.byEmail?.[String(sourceEmail).toLowerCase()]);
+    if (mapped) return mapped;
+    out.warnings.push(recordName + " — " + label + " \"" + (sourceEmail || sourceId) + "\" has no matching destination user; " + (primaryUserId ? "assigned the default user." : "left unassigned."));
+    return primaryUserId || null;
   };
-}
+  const filt = (type) => '/lifecycle-manager/v1/' + type + '?filter%5Bclient.id%5D=' + encodeURIComponent(src.id);
+  const bump = (type, key) => { out.counts[type] = out.counts[type] || { created: 0, skipped: 0, failed: 0 }; out.counts[type][key]++; };
+  const initiativeMap = {};
+  const goalMap = {};
 
-async function requestAlignmentExtraction(tabId) {
-  reportMigrationProgress(`Waiting for questionnaire extraction response from tab ${tabId}…`);
-  return Promise.race([new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { type: 'MYITP_EXTRACT_ALIGNMENT' }, (response) => {
-      if (chrome.runtime.lastError) return resolve(null);
-      resolve(response);
-    });
-  }), new Promise((_, reject) => setTimeout(() => reject(timeoutError('My IT Process questionnaire extraction', QUESTION_EXTRACTION_TIMEOUT_MS)), QUESTION_EXTRACTION_TIMEOUT_MS))]);
-}
-
-async function waitForReviewTabComplete(tabId) {
-  const current = await chrome.tabs.get(tabId);
-  if (current.status === 'complete') return;
-  await Promise.race([new Promise((resolve) => {
-    const listener = (updatedTabId, changeInfo) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-  }), new Promise((_, reject) => setTimeout(() => reject(timeoutError('My IT Process review page load', REVIEW_TAB_TIMEOUT_MS)), REVIEW_TAB_TIMEOUT_MS))]);
-}
-
-async function extractAlignmentFromReviewTab(reviewUrl, sourceTabId) {
-  const tab = await chrome.tabs.create({ url: reviewUrl, active: true });
-  let extractionSucceeded = false;
-  try {
-    reportMigrationProgress(`Opened the My IT Process assessment page for question extraction; the source tab is unchanged.`);
-    await waitForReviewTabComplete(tab.id);
-    let result = await requestAlignmentExtraction(tab.id);
-    for (let retry = 1; result?.ok && result.expectedQuestionCount && result.questions.length < result.expectedQuestionCount && retry <= 2; retry++) {
-      reportMigrationProgress(`Questionnaire was incomplete (${result.questions.length}/${result.expectedQuestionCount}); reloading for extraction retry ${retry}/2…`);
-      await chrome.tabs.reload(tab.id);
-      await waitForReviewTabComplete(tab.id);
-      result = await requestAlignmentExtraction(tab.id);
-    }
-    if (result?.ok && result.expectedQuestionCount && result.questions.length > result.expectedQuestionCount) {
-      throw new Error(`Invalid Alignment extraction: collected ${result.questions.length} of ${result.expectedQuestionCount} expected question(s). Retry stopped before writing to LMX.`);
-    }
-    if (result?.ok && result.questions?.length) {
-      extractionSucceeded = true;
-      return result;
-    }
-    if (result?.error) throw new Error(`My IT Process extraction failed: ${result.error}`);
-    throw new Error('My IT Process content script did not respond. Reload the review page and try again.');
-  } finally {
-    if (tab.id && extractionSucceeded) {
-      await chrome.tabs.remove(tab.id).catch(() => {});
-    } else if (tab.id) {
-      reportMigrationProgress('The My IT Process assessment tab was left open for review after extraction failed.');
-    }
-  }
-}
-
-function canonicalReviewUrl(review) {
-  // /view-details/psa is the PSA/Tickets side panel. It contains the client
-  // grid but not the rendered Alignment question wrappers. Extraction must
-  // use the direct review route, where categories and questions are present.
-  return new URL(`/alignment/${review.reviewId}`, 'https://new.live.myitprocess.com').href;
-}
-
-async function runSelectedAlignmentMigrations({ reviews, evaluateUserId, sourceTabId }) {
-  const log = [];
-  const results = [];
-  const config = await getConfig();
-  const migrations = config.alignmentMigrations || {};
-  let sourceReviewId = null;
-  if (sourceTabId) {
-    const sourceTab = await chrome.tabs.get(sourceTabId).catch(() => null);
-    const sourcePath = sourceTab?.url ? new URL(sourceTab.url).pathname : '';
-    const sourceMatch = sourcePath.match(/^\/alignment\/(\d+)(?:\/|$)/);
-    if (sourceMatch) sourceReviewId = sourceMatch[1];
-  }
-  for (const review of reviews || []) {
-    const effectiveReview = sourceReviewId && reviews.length === 1
-      ? { ...review, reviewId: sourceReviewId }
-      : review;
-    if (effectiveReview.reviewId !== review.reviewId) {
-      reportMigrationProgress(`Using the currently opened My IT Process alignment ${effectiveReview.reviewId}.`);
-    }
-    log.push(`\n${effectiveReview.clientName} — ${effectiveReview.reviewTitle}`);
-    reportMigrationProgress(`Starting ${effectiveReview.clientName} — ${effectiveReview.reviewTitle}.`);
-    const previous = migrations[effectiveReview.reviewId];
-    const previousStatus = previous?.status || (previous ? 'completed' : null);
-    if (previous && previousStatus === 'completed') {
-      log.push(`Skipped: already migrated to LMX assessment ${previous.assessmentId}.`);
-      results.push({ reviewId: effectiveReview.reviewId, skipped: true, assessmentId: previous.assessmentId });
-      continue;
-    }
-    migrations[effectiveReview.reviewId] = {
-      ...(previous || {}),
-      status: 'running',
-      clientName: simplifyRepeatedName(effectiveReview.clientName),
-      lmxClientLabel: effectiveReview.lmxClient.label,
-      startedAt: new Date().toISOString(),
-      lastError: null,
-    };
-    await chrome.storage.local.set({ alignmentMigrations: migrations });
-    try {
-      reportMigrationProgress('Extracting the My IT Process questionnaire.');
-      const reviewUrl = canonicalReviewUrl(effectiveReview);
-      reportMigrationProgress(`Opening ${simplifyRepeatedName(effectiveReview.clientName)} alignment ${effectiveReview.reviewId}.`);
-      const extracted = await extractAlignmentFromReviewTab(reviewUrl, sourceTabId);
-      const result = await runAlignmentMigration({
-        questions: extracted.questions,
-        expectedQuestionCount: extracted.expectedQuestionCount,
-        clientName: simplifyRepeatedName(effectiveReview.clientName),
-        lmxClientId: effectiveReview.lmxClient.id,
-        lmxClientLabel: effectiveReview.lmxClient.label,
-        evaluateUserId,
-        bothComplete: effectiveReview.bothComplete,
-        engineerReviewName: effectiveReview.engineerReviewName,
-        vcioReviewName: effectiveReview.vcioReviewName,
-      });
-      log.push(...result.log);
-      log.push(`Done. LMX assessment id: ${result.assessmentId}`);
-      migrations[effectiveReview.reviewId] = {
-        ...(migrations[effectiveReview.reviewId] || {}),
-        assessmentId: result.assessmentId,
-        templateId: result.templateId,
-        clientName: simplifyRepeatedName(effectiveReview.clientName),
-        lmxClientLabel: effectiveReview.lmxClient.label,
-        migratedAt: new Date().toISOString(),
-        status: result.partial ? 'partial' : 'completed',
-        completed: !!effectiveReview.bothComplete,
-        lastError: null,
-      };
-      await chrome.storage.local.set({ alignmentMigrations: migrations });
-      results.push({
-        reviewId: effectiveReview.reviewId,
-        skipped: false,
-        assessmentId: result.assessmentId,
-        assessmentCreated: result.assessmentCreated,
-        expectedQuestionCount: result.expectedQuestionCount,
-        answeredCount: result.answeredCount,
-        unmatchedCount: result.unmatchedCount,
-        unansweredCount: result.unansweredCount,
-        unmatched: result.unmatched,
-        unanswered: result.unanswered,
-        evaluationFailures: result.evaluationFailures,
-        commentFailures: result.commentFailures,
-        warningCount: result.warningCount,
-        retryable: result.retryable,
-        partial: !!result.partial,
-      });
-    } catch (err) {
-      const errorMessage = err.message || String(err);
-      log.push(`Error: ${errorMessage}`);
-      migrations[effectiveReview.reviewId] = {
-        ...(migrations[effectiveReview.reviewId] || {}),
-        status: 'failed',
-        lastError: errorMessage,
-        failedAt: new Date().toISOString(),
-      };
-      await chrome.storage.local.set({ alignmentMigrations: migrations });
-      results.push({ reviewId: effectiveReview.reviewId, error: errorMessage });
-    }
-  }
-  return { log, results };
-}
-
-/**
- * IT Plan -> LMX Roadmap. Each SO plan item becomes one LMX initiative: name + summary at
- * creation, then schedule/status/budget set via their dedicated update endpoints (mirrors
- * how assessments needed a create -> GET -> per-field-update flow). Unlike assessment
- * questions, initiatives have no separate internal-comment endpoint, so everything that
- * isn't a first-class field (raw SO status wording, budget month, schedule bucket text)
- * gets folded into the executive summary instead - see buildPlanFullSummary().
- */
-async function runPlanMigration({ planItems, soClientName, lmxClientId, lmxClientLabel }) {
-  const log = [];
-  const push = (msg) => { log.push(msg); };
-
-  if (!lmxClientId) throw new Error('No LMX client mapped for this My IT Process client yet.');
-  if (!planItems || !planItems.length) throw new Error('No IT Plan items found on this page.');
-
-  push(`Migrating ${planItems.length} IT Plan item(s) to LMX Roadmap...`);
-
-  const unscheduled = [];
-  const failed = [];
-  let createdCount = 0;
-
-  for (const item of planItems) {
-    let initiativeId;
-    try {
-      const created = await lmx.createInitiative({
-        client_key: { id: lmxClientId, name: lmxClientLabel },
-        name: item.name,
-        executive_summary: self.SO_LMX_MAPPING.buildPlanFullSummary(item),
-      });
-      initiativeId = created.id;
-      createdCount++;
-    } catch (err) {
-      failed.push(`${item.name}: create failed - ${err.message}`);
-      continue;
-    }
-
-    const quarter = self.SO_LMX_MAPPING.quarterLabelToNumber(item.quarterLabel);
-    const year = self.SO_LMX_MAPPING.parseYear(item.budgetYear) || self.SO_LMX_MAPPING.parseYear(item.yearLabel);
-    if (quarter && year) {
+  if (objects.initiatives) {
+    const rows = await tenantPages('source', '/lifecycle-manager/v2/initiatives?filter%5Bclient.id%5D=eq%3A' + encodeURIComponent(src.id) + '&include_internal=true&include_unscheduled=true');
+    for (const it of rows) {
+      const lk = dst.id + '|initiative|' + it.id;
+      if (ledger[lk]) { initiativeMap[it.id] = ledger[lk]; bump('initiatives', 'skipped'); continue; }
       try {
-        await lmx.updateInitiativeSchedule(initiativeId, { fiscal_quarter: { year, quarter } });
-      } catch (err) {
-        push(`  - ${item.name}: failed to set schedule - ${err.message}`);
-      }
-    } else {
-      unscheduled.push(`${item.name} (SO bucket: ${[item.yearLabel, item.quarterLabel].filter(Boolean).join(' / ') || 'none'})`);
+        const detail = await tenantFetch('source', '/cs/v1/initiatives/' + it.id).catch(() => null);
+        const d = detail?.initiative || detail || {};
+        const created = await tenantFetch('dest', '/cs/v1/initiatives', { method: 'POST', body: {
+          client_key: { id: dst.id, name: dst.name }, name: it.name,
+          executive_summary_json: d.executive_summary_json || null,
+        } });
+        const id = created.id;
+        await tenantRecord(lk, id);
+        initiativeMap[it.id] = id;
+        const w = [];
+        const put = (label, path, body) => attempt(w, label, () => tenantFetch('dest', '/cs/v1/initiatives/' + id + path, { method: 'PUT', body }));
+        if (it.status) await put('Status', '/status', { status: it.status });
+        if (it.priority) await put('Priority', '/priority', { priority: it.priority });
+        if (it.fiscal_quarter?.year) await put('Schedule', '/schedule', clampSchedule({ fiscal_quarter: { year: it.fiscal_quarter.year, quarter: it.fiscal_quarter.quarter } }).body);
+        else if (it.target_start_date && it.target_end_date) await put('Schedule', '/schedule', clampSchedule({ target_start_date: it.target_start_date, target_end_date: it.target_end_date, target_precision: it.target_precision || 'Month' }).body);
+        if (it.budget?.line_items?.length) await put('Budget', '/budget', { budget_line_items: cleanLines(it.budget.line_items) });
+        if (it.budget?.recurring_line_items?.length) await put('Recurring', '/recurring', { recurring_line_items: cleanLines(it.budget.recurring_line_items) });
+        const owner = resolveUser(it.assigned_user_id || it.assigned_user?.id || d.assigned_user_id || d.assigned_user?.id || null,
+          it.assigned_user?.email || d.assigned_user?.email || null, "Owner", it.name);
+        if (owner) await put('Owner', '/assigned-user', { assigned_user_id: owner });
+        for (const x of w) out.warnings.push(it.name + ' — ' + x);
+        bump('initiatives', 'created');
+      } catch (error) { bump('initiatives', 'failed'); out.errors.push('Initiative "' + it.name + '": ' + error.message); }
+      await sleep(120);
     }
+  }
 
-    try {
-      await lmx.updateInitiativeStatus(initiativeId, { initiative_status_id: self.SO_LMX_MAPPING.planStatusToLMX(item.status) });
-    } catch (err) {
-      push(`  - ${item.name}: failed to set status - ${err.message}`);
-    }
-
-    const budgetSubunits = self.SO_LMX_MAPPING.parseMoneyToSubunits(item.confirmedBudget) ?? self.SO_LMX_MAPPING.parseMoneyToSubunits(item.estimatedBudget);
-    if (budgetSubunits) {
-      const label = item.confirmedBudget ? 'Confirmed Budget (from My IT Process)' : 'Estimated Budget (from My IT Process)';
+  if (objects.goals) {
+    for (const g of await tenantPages('source', filt('goals'))) {
+      const lk = dst.id + '|goal|' + g.id;
+      if (ledger[lk]) { goalMap[g.id] = ledger[lk]; bump('goals', 'skipped'); continue; }
       try {
-        await lmx.updateInitiativeBudget(initiativeId, {
-          budget_line_items: [{ label, cost_subunits: budgetSubunits, cost_type: 'Fixed', display_order: 0 }],
-        });
-      } catch (err) {
-        push(`  - ${item.name}: failed to set budget - ${err.message}`);
-      }
+        const created = await tenantFetch('dest', '/lifecycle-manager/v1/goals', { method: 'POST', body: {
+          client_key: { id: dst.id }, title: g.title, description: g.description || '', status: g.status || 'OnTrack', target_period: g.period || g.target_period || null,
+        } });
+        const id = created.id || created.goal_id;
+        await tenantRecord(lk, id);
+        goalMap[g.id] = id;
+        bump('goals', 'created');
+      } catch (error) { bump('goals', 'failed'); out.errors.push('Goal "' + g.title + '": ' + error.message); }
+      await sleep(120);
     }
   }
 
-  push(`Created ${createdCount} of ${planItems.length} initiative(s) in LMX.`);
-  if (failed.length) push(`Warning: ${failed.length} item(s) failed entirely:\n  ${failed.join('\n  ')}`);
-  if (unscheduled.length) {
-    push(`${unscheduled.length} item(s) had no parseable year/quarter and were left unscheduled in LMX (SO used a placeholder or non-numeric year label - schedule them manually):\n  ${unscheduled.join('\n  ')}`);
+  if (objects.notes) {
+    for (const n of await tenantPages('source', filt('notes'))) {
+      const nid = n.note_id || n.id;
+      const lk = dst.id + '|note|' + nid;
+      if (ledger[lk]) { bump('notes', 'skipped'); continue; }
+      try {
+        const created = await tenantFetch('dest', '/lifecycle-manager/v1/notes', { method: 'POST', body: { client_key: { id: dst.id }, title: n.title || 'Note', description_json: n.description_json || null } });
+        await tenantRecord(lk, created.id || created.note_id);
+        bump('notes', 'created');
+      } catch (error) { bump('notes', 'failed'); out.errors.push('Note "' + (n.title || nid) + '": ' + error.message); }
+      await sleep(120);
+    }
   }
 
-  return { createdCount, log };
+  if (objects.assessments) {
+    const destTemplates = (await tenantFetch('dest', '/lifecycle-manager/v1/assessment-templates'))?.data || [];
+    for (const a of await tenantPages('source', filt('assessments'))) {
+      const lk = dst.id + '|assessment|' + a.id;
+      if (ledger[lk]) { bump('assessments', 'skipped'); continue; }
+      try {
+        const detail = (await tenantFetch('source', '/lifecycle-manager/v1/assessments/' + a.id))?.assessment;
+        const evaluatorId = resolveUser(detail.evaluate_user_id || detail.evaluate_user?.id || a.evaluate_user_id || null,
+          detail.evaluate_user?.email || detail.evaluate_user?.contact_info?.email || null, "Evaluator", a.title);
+        if (!evaluatorId) throw new Error('Choose a destination evaluating user.');
+        const templateId = await tenantCopyTemplate(detail.assessment_template_id, destTemplates);
+        const created = await tenantFetch('dest', '/lifecycle-manager/v1/assessments', { method: 'POST', body: {
+          client_key: { id: dst.id }, title: a.title, assessment_template_id: templateId,
+          evaluate_user_id: evaluatorId, evaluate_at: a.evaluated_at || a.completed_at || new Date().toISOString(),
+        } });
+        const newId = created.id;
+        await tenantRecord(lk, newId);
+        // Map answers by category + question title and criterion label.
+        const inst = (await tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId))?.assessment || {};
+        const norm = (s) => String(s || '').trim().toLowerCase();
+        const target = new Map();
+        for (const c of inst.category_list || []) for (const q of c.question_list || []) target.set(norm(c.title) + '|' + norm(q.title), q);
+        const evaluations = [];
+        const comments = [];
+        let unmatched = 0;
+        for (const c of detail.category_list || []) for (const q of c.question_list || []) {
+          const sel = (q.criteria_list || []).find((x) => x.is_selected);
+          const t = target.get(norm(c.title) + '|' + norm(q.title));
+          if (!t) { if (sel) unmatched++; continue; }
+          if (sel) {
+            const tc = (t.criteria_list || []).find((x) => norm(x.label_key) === norm(sel.label_key) || norm(x.display_label) === norm(sel.display_label));
+            if (tc) evaluations.push({ question_id: t.assessment_question_id, selected_criteria_id: tc.assessment_criterion_id });
+          }
+          const pub = typeof q.public_comment === 'string' ? q.public_comment : q.public_comment?.comment_plain_text;
+          if (pub) comments.push({ id: t.assessment_question_id, kind: 'public', text: pub });
+          const internal = (q.internal_comments || []).map((x) => (typeof x === 'string' ? x : x?.comment_plain_text || x?.comment)).filter(Boolean).join('\n');
+          if (internal) comments.push({ id: t.assessment_question_id, kind: 'internal', text: internal });
+        }
+        const w = [];
+        for (let i = 0; i < evaluations.length; i += 25) await attempt(w, 'Answers', () => tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId + '/evaluate', { method: 'PUT', body: { question_evaluations: evaluations.slice(i, i + 25) } }));
+        for (const cm of comments) await attempt(w, cm.kind + ' comment', () => tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId + '/questions/' + cm.id + '/comment/' + cm.kind, { method: 'PUT', body: { comment_plain_text: cm.text.slice(0, 1000) } }));
+        if (detail.internal_comment) await attempt(w, 'Summary', () => tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId + '/internal-comment', { method: 'PUT', body: { internal_comment: String(detail.internal_comment).slice(0, 1000) } }));
+        if (a.status === 'Completed' || a.completed_at) await attempt(w, 'Mark complete', () => tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId + '/completion-status', { method: 'PUT', body: { is_completed: true } }));
+        if (unmatched) w.push(unmatched + ' answer(s) had no matching question');
+        for (const x of w) out.warnings.push(a.title + ' — ' + x);
+        bump('assessments', 'created');
+      } catch (error) { bump('assessments', 'failed'); out.errors.push('Assessment "' + a.title + '": ' + error.message); }
+      await sleep(120);
+    }
+  }
+
+  // Goal → initiative links (both sides must have migrated).
+  if (objects.goals && objects.initiatives) {
+    for (const [srcGoal, dstGoal] of Object.entries(goalMap)) {
+      const links = await tenantFetch('source', '/lifecycle-manager/v1/goals/' + srcGoal + '/initiatives').catch(() => null);
+      for (const srcInit of links?.initiative_ids || []) {
+        const dstInit = initiativeMap[srcInit];
+        if (!dstInit) continue;
+        await attempt(out.warnings, 'Link goal→initiative', () => tenantFetch('dest', '/lifecycle-manager/v1/goals/' + dstGoal + '/initiatives/' + dstInit, { method: 'PUT' }));
+      }
+    }
+  }
+  return out;
 }
 
 // ---------- message router ----------
@@ -1073,53 +1177,176 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         case 'SET_EVALUATE_USER':
           await setEvaluateUser(message.evaluateUserId);
           return sendResponse({ ok: true });
-        case 'SEARCH_LMX_CLIENTS':
-          return sendResponse({ ok: true, data: await lmx.lookupClients(message.query) });
         case 'LIST_LMX_CLIENTS':
           return sendResponse({ ok: true, data: await allLmxClients() });
-        case 'SAVE_CLIENT_MAPPING':
-          await saveClientMapping(message.soClientName, message.lmxClient);
-          return sendResponse({ ok: true });
-        case 'CLEAR_CLIENT_MAPPING':
-          await clearClientMapping(message.soClientName);
-          return sendResponse({ ok: true });
         case 'RECENT_EVALUATORS':
           return sendResponse({ ok: true, data: await recentEvaluators() });
-        case 'VERIFY_ALIGNMENT_MIGRATIONS':
-          return sendResponse({ ok: true, data: await verifyAlignmentMigrations() });
-        case 'DELETE_ALIGNMENT_MIGRATION':
-          return sendResponse({ ok: true, data: await deleteAlignmentMigration(message.reviewId, message.assessmentId) });
-        case 'CREATE_SO_TEMPLATE': {
-          const id = await createSOTemplate();
-          return sendResponse({ ok: true, data: { templateId: id } });
+        case 'LIST_TEMPLATE_TITLES': {
+          const list = await lmx.listTemplates();
+          const titles = (list?.data || []).map((t) => ({ id: t.assessment_template_id, title: t.title || '' }));
+          return sendResponse({ ok: true, data: titles });
         }
-        case 'GET_SO_TEMPLATE': {
-          const { soTemplateId } = await getConfig();
-          if (!soTemplateId) return sendResponse({ ok: true, data: null });
-          const tmpl = await lmx.getTemplate(soTemplateId);
-          return sendResponse({ ok: true, data: { templateId: soTemplateId, title: tmpl.assessment_template.title } });
+        case 'CREATE_PROPEL_TEMPLATE': {
+          const builder = { myitprocess: self.MyItp, strategyoverview: self.SoAdapter }[message.source] || self.Propel;
+          const { payload, omissions } = builder.prepareTemplate(message.questionnaire);
+          try {
+            const created = await lmx.createTemplate(payload);
+            return sendResponse({ ok: true, data: { templateId: created.assessment_template_id, omissions } });
+          } catch (error) {
+            if (/-> 403/.test(error.message)) {
+              return sendResponse({ ok: false, error: 'The ScalePad CS API firewall rejected some of this questionnaire\'s text (HTTP 403). Check the API key\'s permissions, or report the blocked content to ScalePad.' });
+            }
+            throw error;
+          }
         }
-        case 'GET_ALIGNMENT_TEMPLATE': {
-          const { alignmentTemplateId } = await getConfig();
-          if (!alignmentTemplateId) return sendResponse({ ok: true, data: null });
-          const tmpl = await lmx.getTemplate(alignmentTemplateId);
-          return sendResponse({ ok: true, data: { templateId: alignmentTemplateId, title: tmpl.assessment_template.title } });
+        case 'TENANT_SET_SOURCE_KEY':
+          return sendResponse({ ok: true, data: await tenantSetSourceKey(message.apiKey) });
+        case 'TENANT_STATUS': {
+          const { [TENANT_SOURCE_KEY]: key } = await chrome.storage.session.get(TENANT_SOURCE_KEY);
+          return sendResponse({ ok: true, data: { hasSourceKey: !!key, sameTenant: !!key && key === (await getConfig()).apiKey } });
         }
-        case 'RUN_ALIGNMENT_MIGRATION': {
-          const result = await runAlignmentMigration(message.payload);
-          return sendResponse({ ok: true, data: result });
+        case 'TENANT_CLIENTS':
+          return sendResponse({ ok: true, data: { source: await tenantClients('source'), dest: await tenantClients('dest') } });
+        case 'TENANT_USER_MATCH':
+          return sendResponse({ ok: true, data: await tenantUserMatch() });
+        case 'TENANT_MIGRATE_CLIENT':
+          return sendResponse({ ok: true, data: await tenantMigrateClient(message.payload) });
+        case 'CLEANUP_LIST_ACCOUNT_ITEMS':
+          return sendResponse({ ok: true, data: await listAccountItems(message.types || Object.keys(TEMPLATE_TYPES)) });
+        case 'CLEANUP_DELETE_ACCOUNT_ITEMS':
+          return sendResponse({ ok: true, data: await deleteAccountItems(message.items || []) });
+        case 'CM_PORTFOLIO':
+          return sendResponse({ ok: true, data: await cmPortfolio() });
+        case 'CM_CLIENT_ITEMS':
+          return sendResponse({ ok: true, data: await cmClientItems(message.clientId) });
+        case 'CM_SYNC':
+          return sendResponse({ ok: true, data: await cmSync(message.payload) });
+        case 'CLEANUP_PREVIEW':
+          return sendResponse({ ok: true, data: await cleanupPreview(message.payload) });
+        case 'CLEANUP_DELETE_TYPE':
+          return sendResponse({ ok: true, data: await cleanupDeleteType(message.payload) });
+        case 'MIGRATE_PROPEL_AUDIT':
+          return sendResponse({ ok: true, data: await migratePropelAudit(message.payload) });
+        case 'MIGRATE_PROPEL_PROJECT':
+          return sendResponse({ ok: true, data: await migratePropelProject(message.payload) });
+        case 'LINK_PROPEL_FINDINGS':
+          return sendResponse({ ok: true, data: await linkPropelFindings(message.payload) });
+        case 'GET_PROPEL_LEDGER':
+          return sendResponse({ ok: true, data: await propelLedger() });
+        case 'LIST_SP_CLIENTS': {
+          // All ScalePad clients with their PSA source ids, for Propel company matching.
+          const clients = [];
+          let cursor = null;
+          for (let page = 0; page < 100; page++) {
+            const res = await lmxFetch('/core/v1/clients?page_size=200' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''));
+            for (const c of res?.data || []) {
+              clients.push({
+                id: c.id,
+                name: c.name || '',
+                psaIds: (c.record_lineage || [])
+                  .filter((l) => l.source_record_id != null)
+                  .map((l) => ({ vendor: l.integration_configuration?.vendor?.brand_name || '', id: String(l.source_record_id) })),
+              });
+            }
+            cursor = res?.next_cursor;
+            if (!cursor) break;
+          }
+          return sendResponse({ ok: true, data: clients });
         }
-        case 'RUN_SELECTED_ALIGNMENT_MIGRATIONS': {
-          const result = await runSelectedAlignmentMigrations(message.payload);
-          return sendResponse({ ok: true, data: result });
+        case 'LIST_INITIATIVE_TEMPLATE_NAMES': {
+          const names = [];
+          let cursor = null;
+          for (let page = 0; page < 50; page++) {
+            const res = await lmx.listInitiativeTemplatesPage(cursor);
+            for (const t of res?.data || []) names.push({ id: t.initiative_template_id, name: t.name || '' });
+            cursor = res?.next_cursor;
+            if (!cursor) break;
+          }
+          return sendResponse({ ok: true, data: names });
         }
-        case 'RUN_MIGRATION': {
-          const result = await runMigration(message.payload);
-          return sendResponse({ ok: true, data: result });
+        case 'CREATE_INITIATIVE_TEMPLATE': {
+          const template = message.template;
+          const tagIds = await ensureInitiativeTags(self.Propel.initiativeTagNames(template));
+          const { payload, notes } = self.Propel.prepareInitiativeTemplate(template, { tagIds, rich: message.rich !== false });
+          try {
+            const created = await lmx.createInitiativeTemplate(payload);
+            return sendResponse({ ok: true, data: { templateId: created.initiative_template_id, notes } });
+          } catch (error) {
+            if (/-> 403/.test(error.message)) {
+              return sendResponse({ ok: false, error: 'The ScalePad CS API firewall rejected some of this template\'s text (HTTP 403). Check the API key\'s permissions, or report the blocked content to ScalePad.' });
+            }
+            throw error;
+          }
         }
-        case 'RUN_PLAN_MIGRATION': {
-          const result = await runPlanMigration(message.payload);
-          return sendResponse({ ok: true, data: result });
+        case 'GET_VENDOR_ACCESS': {
+          const origins = Array.isArray(message.origins) ? message.origins : [];
+          const granted = origins.length ? await chrome.permissions.contains({ origins }) : false;
+          return sendResponse({ ok: true, data: { granted, origins } });
+        }
+        case 'REQUEST_VENDOR_ACCESS': {
+          const origins = Array.isArray(message.origins) ? message.origins : [];
+          if (!origins.length) return sendResponse({ ok: false, error: 'No vendor page access scope was supplied.' });
+          const granted = await chrome.permissions.request({ origins });
+          return sendResponse({ ok: true, data: { granted, origins } });
+        }
+        case 'GET_SIDE_PANEL_STATE': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          return sendResponse({ ok: true, data: await getSidePanelState(tabId) });
+        }
+        case 'GET_SIDE_PANEL_CONTEXT': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          const context = await requestSidePanelPageContext(tabId);
+          const data = context ? await updateSidePanelPageContext(tabId, context) : await getSidePanelState(tabId);
+          return sendResponse({ ok: true, data });
+        }
+        case 'SIDE_PANEL_PAGE_CONTEXT': {
+          const tabId = message.tabId ?? _sender?.tab?.id;
+          const data = await updateSidePanelPageContext(tabId, message.context);
+          return sendResponse({ ok: true, data });
+        }
+        case 'RECORD_SIDE_PANEL_EVENT': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          const current = await getSidePanelState(tabId);
+          const event = message.event || {};
+          const next = {
+            ...current,
+            events: [
+              ...(current.events || []),
+              {
+                label: String(event.label || 'Workspace action').slice(0, 120),
+                detail: String(event.detail || '').slice(0, 240),
+                icon: String(event.icon || '•').slice(0, 3),
+                createdAt: new Date().toISOString(),
+              },
+            ].slice(-30),
+          };
+          return sendResponse({ ok: true, data: await saveSidePanelState(tabId, next) });
+        }
+        case 'TOGGLE_SIDE_PANEL_FOLLOW_UP': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          const current = await getSidePanelState(tabId);
+          return sendResponse({ ok: true, data: await saveSidePanelState(tabId, { ...current, followUp: !current.followUp }) });
+        }
+        case 'CLEAR_SIDE_PANEL_ACTIVITY': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          const current = await getSidePanelState(tabId);
+          return sendResponse({ ok: true, data: await saveSidePanelState(tabId, { ...current, events: [] }) });
+        }
+        case 'SAVE_SIDE_PANEL_NOTE': {
+          const tabId = await resolveSidePanelTabId(message.tabId);
+          const current = await getSidePanelState(tabId);
+          const text = String(message.text || '').trim().slice(0, 2000);
+          if (!text) return sendResponse({ ok: false, error: 'Note text is empty.' });
+          const createdAt = new Date().toISOString();
+          const next = {
+            ...current,
+            notes: [...(current.notes || []), { text, createdAt }].slice(-30),
+            events: [
+              ...(current.events || []),
+              { label: 'Added a note', detail: text.slice(0, 180), icon: '+', createdAt },
+            ].slice(-30),
+          };
+          return sendResponse({ ok: true, data: await saveSidePanelState(tabId, next) });
         }
         default:
           return sendResponse({ ok: false, error: `Unknown message type: ${message.type}` });
