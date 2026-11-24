@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="extension/icons/scalepad-logo.svg" alt="ScalePad" width="260">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="extension/icons/scalepad-logo-white.svg">
+    <img src="extension/icons/scalepad-logo.svg" alt="ScalePad" width="260">
+  </picture>
 </p>
 
 <h1 align="center">ScalePad Migration Utility</h1>
