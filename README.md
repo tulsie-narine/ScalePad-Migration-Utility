@@ -231,11 +231,20 @@ Open them from **ScalePad utilities** on the home screen, or the wrench in the s
 
 ### Tenant migration
 
-Copies client data from one ScalePad tenant to another: initiatives, goals, notes and assessments, with goal → initiative links.
+Copies a ScalePad tenant's setup and client data into another tenant.
+
+| Copied | What comes with it |
+|---|---|
+| **Account setup** (once per run) | Tags, custom initiative statuses and labels, goal outcomes, meeting types, and your own meeting, task, initiative, goal, roadmap, agreement and deliverable templates. Anything that already exists with the same name is reused. |
+| **Client data** | Initiatives (budget, schedule, status, owner), goals, notes, assessments, meetings (attendees, completion), tasks (assignees, completion, pin), manual agreements and their line items, deliverables rebuilt from their template, client tags |
+| **Links** | Goal → initiative; meeting → initiative, goal and note; task → initiative, goal and meeting; initiative tags, external links, files and linked assessment findings |
+
+Not copied: clients, contacts, users, hardware, PSA-synced agreements, tickets and quotes. These come from each tenant's own integrations, and the utility matches against them instead.
 
 1. Paste the **source tenant's API key**. It's kept only for this browser session.
-2. Pick the source client and the destination client.
-3. Run. Items already copied are remembered and skipped next time.
+2. Choose the account setup and client data to copy, then pick each source client and its destination client.
+3. Check the user matching. Owners, assignees, creators and evaluators are matched by email, then by name; the **default assigned user** covers anyone without a match.
+4. Run. Items already copied are remembered and skipped next time.
 
 <br clear="right">
 

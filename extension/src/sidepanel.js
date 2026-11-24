@@ -544,13 +544,24 @@ const UTILITY_RENDERERS = {
 
 // ----- Tenant migration (v1) -----
 
-const TENANT_OBJECTS = { initiatives: 'Initiatives', goals: 'Goals', notes: 'Notes', assessments: 'Assessments' };
+const TENANT_OBJECTS = {
+  initiatives: 'Initiatives', goals: 'Goals', notes: 'Notes', assessments: 'Assessments',
+  meetings: 'Meetings', tasks: 'Tasks', agreements: 'Agreements', deliverables: 'Deliverables',
+  extras: 'Initiative tags, links & files', clientTags: 'Client tags',
+};
+// Account-wide setup, copied once per run (cross-tenant only) and matched by name.
+const TENANT_ACCOUNT = {
+  tags: 'Tags', statuses: 'Initiative statuses', outcomes: 'Goal outcomes', meetingTypes: 'Meeting types',
+  meetingTemplates: 'Meeting templates', taskTemplates: 'Task templates', initiativeTemplates: 'Initiative templates',
+  goalTemplates: 'Goal templates', roadmapTemplates: 'Roadmap templates', agreementTemplates: 'Agreement templates',
+  deliverableTemplates: 'Deliverable templates',
+};
 
 function tenantState() {
   if (!state.tenant) {
     state.tenant = {
       status: null, clients: null, loading: false, error: null, search: '', limit: 40,
-      mapping: {}, selected: new Set(), objects: new Set(Object.keys(TENANT_OBJECTS)), ownerId: null,
+      mapping: {}, selected: new Set(), objects: new Set(Object.keys(TENANT_OBJECTS)), account: new Set(Object.keys(TENANT_ACCOUNT)), ownerId: null,
       users: null, usersLoading: false, usersError: null, usersAll: false,
       run: { running: false, items: [], done: 0, phase: '' },
     };
@@ -706,23 +717,33 @@ function renderTenantSetup() {
       h('div', { text: t.status.sameTenant
         ? 'Source and destination are the same tenant: this clones client data. Pick each destination client explicitly.'
         : 'Copying from the source tenant into the tenant connected in Settings. Re-runs skip anything already copied.' })),
+    t.status.sameTenant ? '' : h('section', { class: 'card' },
+      h('h2', { class: 'card-title', text: 'Account setup' }),
+      h('p', { class: 'field-help', text: 'Copied once per run. Items that already exist in the destination with the same name are reused, never duplicated. Built-in ScalePad templates are matched, not copied.' }),
+      tenantChips(TENANT_ACCOUNT, t.account)),
     h('section', { class: 'card' },
-      h('h2', { class: 'card-title', text: 'What to copy' }),
-      h('div', { class: 'type-grid' }, ...Object.entries(TENANT_OBJECTS).map(([k, label]) => {
-        const box = h('input', { type: 'checkbox' });
-        box.checked = t.objects.has(k);
-        box.addEventListener('change', () => { box.checked ? t.objects.add(k) : t.objects.delete(k); mountTenantBar(); });
-        return h('label', { class: 'toggle-chip' }, box, label);
-      })),
-      h('div', { class: 'field' }, h('span', { class: 'field-label', text: 'Owner and evaluator in the destination' }), owner,
-        h('span', { class: 'field-help', text: t.status.sameTenant ? 'Owners and evaluators are kept as-is; this user is used only when a record has none.' : 'Owners and evaluators carry over using the matching below. This user is used only when a source user has no match.' })),
-      h('p', { class: 'field-help', style: 'margin-top:10px', text: 'Coming next: action items, meetings, contracts, deliverables, and tags.' })),
+      h('h2', { class: 'card-title', text: 'Client data to copy' }),
+      tenantChips(TENANT_OBJECTS, t.objects),
+      h('div', { class: 'field' }, h('span', { class: 'field-label', text: 'Default assigned user' }), owner,
+        h('span', { class: 'field-help', text: t.status.sameTenant
+          ? 'Owners, assignees and evaluators are kept as-is; this user is used only when a record has none.'
+          : 'Each record keeps its source owner, assignee, creator or evaluator, matched to a destination user below. This user is used only when there is no match.' })),
+      h('p', { class: 'field-help', style: 'margin-top:10px', text: 'PSA-synced agreements, contacts, hardware and tickets come from the destination’s own integrations, so they aren’t copied. Deliverables are rebuilt from their template.' })),
     renderTenantUserMatch(),
     h('div', { class: 'review-toolbar' }, h('h2', { text: 'Clients' }), h('span', { class: 'muted small', text: t.selected.size + ' selected of ' + t.clients.source.length })),
     h('div', { class: 'tenant-search client-search' }, search),
     h('div', { class: 'client-list' }, ...rows.slice(0, t.limit).map(renderTenantRow)),
     rows.length > t.limit ? h('button', { class: 'btn btn-ghost btn-block', type: 'button', onclick: () => { t.limit += 40; rerenderTenant(); } }, 'Show more') : '',
     h('button', { class: 'link-btn', type: 'button', style: 'margin-top:8px', onclick: async () => { await send({ type: 'TENANT_SET_SOURCE_KEY', apiKey: '' }); state.tenant = null; rerenderTenant(); } }, 'Disconnect source tenant'));
+}
+
+function tenantChips(defs, set) {
+  return h('div', { class: 'type-grid' }, ...Object.entries(defs).map(([k, label]) => {
+    const box = h('input', { type: 'checkbox' });
+    box.checked = set.has(k);
+    box.addEventListener('change', () => { box.checked ? set.add(k) : set.delete(k); mountTenantBar(); });
+    return h('label', { class: 'toggle-chip' }, box, label);
+  }));
 }
 
 function renderTenantRow(src) {
@@ -742,7 +763,7 @@ function renderTenantRow(src) {
 
 function mountTenantBar() {
   const t = tenantState();
-  const ready = t.selected.size && t.objects.size && (!t.objects.has('assessments') && !t.objects.has('initiatives') || t.ownerId);
+  const ready = t.selected.size && t.objects.size && (!['assessments', 'initiatives', 'tasks'].some((k) => t.objects.has(k)) || t.ownerId);
   mountActionBar(h('div', { class: 'action-bar' },
     h('span', { class: 'count' }, h('strong', { text: String(t.selected.size) }), ' clients'),
     h('button', { class: 'btn btn-primary', type: 'button', disabled: !ready, title: ready ? '' : 'Select clients, what to copy, and a destination user', onclick: runTenantMigration },
@@ -757,10 +778,27 @@ async function runTenantMigration() {
     return { src, dst, status: 'queued', counts: {}, warnings: [], errors: [] };
   }).filter((i) => i.dst);
   const objs = [...t.objects].map((o) => TENANT_OBJECTS[o].toLowerCase()).join(', ');
-  if (!confirm('Copy ' + objs + ' for ' + items.length + ' client(s) into the destination tenant?\n\nThis creates records in ScalePad CS. Already-copied records are skipped.')) return;
-  t.run = { running: true, items, done: 0, phase: '' };
+  const cross = !t.status?.sameTenant;
+  const account = cross ? [...t.account] : [];
+  const setupLine = account.length ? '\nAccount setup: ' + account.map((a) => TENANT_ACCOUNT[a].toLowerCase()).join(', ') + '.\n' : '';
+  if (!confirm('Copy ' + objs + ' for ' + items.length + ' client(s) into the destination tenant?\n' + setupLine + '\nThis creates records in ScalePad CS. Already-copied records are skipped.')) return;
+  // Account setup runs first (even with nothing selected) so client records can map tags, statuses, meeting types and templates.
+  const setup = cross ? { src: { name: 'Account setup' }, dst: { name: 'destination tenant' }, status: 'queued', counts: {}, warnings: [], errors: [], account: true } : null;
+  t.run = { running: true, items: setup ? [setup, ...items] : items, done: 0, phase: '' };
   rerenderTenant();
-  for (const item of t.run.items) {
+  if (setup) {
+    setup.status = 'running';
+    t.run.phase = account.length ? 'Copying account setup…' : 'Matching account setup…';
+    rerenderTenant();
+    const res = await send({ type: 'TENANT_ACCOUNT_SETUP', payload: { types: account, userMap: tenantUserMap() } });
+    if (res.ok) Object.assign(setup, res.data); else setup.errors.push(res.error);
+    setup.status = setup.errors.length ? (Object.values(setup.counts).some((c) => c.created) ? 'partial' : 'failed') : setup.warnings.length ? 'warning' : 'done';
+    setItemIssues('tenant', 'Account setup', [...setup.errors.map((e) => ({ severity: 'error', detail: e })), ...setup.warnings.map((w) => ({ severity: 'warning', detail: w }))]);
+    await saveIssues();
+    t.run.done++;
+    rerenderTenant();
+  }
+  for (const item of items) {
     item.status = 'running';
     t.run.phase = 'Copying ' + item.src.name + ' → ' + item.dst.name + '…';
     rerenderTenant();
@@ -780,7 +818,7 @@ async function runTenantMigration() {
   }
   t.run.running = false;
   rerenderTenant();
-  await recordEvent('Tenant migration', t.run.items.length + ' client(s) copied');
+  await recordEvent('Tenant migration', items.length + ' client(s) copied');
   showToast('Tenant migration finished.');
 }
 
@@ -1410,16 +1448,16 @@ function renderSettings() {
   evaluator.addEventListener('change', async () => {
     state.config.evaluateUserId = evaluator.value;
     await send({ type: 'SET_EVALUATE_USER', evaluateUserId: evaluator.value });
-    showToast('Evaluating user saved.');
+    showToast('Default assigned user saved.');
     renderRail();
   });
   const defaultsCard = h('section', { class: 'card', 'aria-labelledby': 'defaultsTitle' },
     h('h2', { id: 'defaultsTitle', class: 'card-title', text: 'Migration defaults' }),
-    h('p', { class: 'muted', text: 'Applied to every assessment created in ScalePad CS.' }),
+    h('p', { class: 'muted', text: 'Each migrated item keeps its owner: the person who owns, created or evaluated it in the source is matched to a ScalePad user by email, then by name.' }),
     h('div', { class: 'field' },
-      h('label', { class: 'field-label', for: 'evaluatorSelect', text: 'Evaluating user' }),
+      h('label', { class: 'field-label', for: 'evaluatorSelect', text: 'Default assigned user' }),
       evaluator,
-      h('span', { class: 'field-help', text: ok ? 'Imported assessments are evaluated as this user.' : 'Connect the API to load users.' }),
+      h('span', { class: 'field-help', text: ok ? 'Used only when the source person can’t be matched to a ScalePad user, for owners, assignees and assessment evaluators.' : 'Connect the API to load users.' }),
     ),
   );
 

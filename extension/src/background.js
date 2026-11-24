@@ -1011,8 +1011,219 @@ async function tenantCopyTemplate(srcTemplateId, destTemplates) {
   return created.assessment_template_id;
 }
 
+// ---------- Tenant migration phase 2: account setup (copied once per run, matched by name) ----------
+
+const TENANT_MAPS_KEY = 'tenantAccountMaps';
+
+/** List endpoints are a mix of paged and plain {data[]}; this reads either. */
+async function tenantList(side, path) {
+  try { return await tenantPages(side, path); }
+  catch (error) {
+    if (!/-> 4\d\d/.test(error.message)) throw error;
+    return (await tenantFetch(side, path))?.data || [];
+  }
+}
+
+/** Raw fetch for binary bodies (attachments). */
+async function tenantRaw(side, path, init = {}) {
+  const key = await tenantKey(side);
+  const res = await fetch(API_BASE + path, { ...init, headers: { 'x-api-key': key, ...(init.headers || {}) } });
+  if (!res.ok) throw new Error('LMX API ' + (init.method || 'GET') + ' ' + path + ' -> ' + res.status);
+  return res;
+}
+
 /**
- * Migrate one client. payload: { src:{id,name}, dst:{id,name}, objects:{initiatives,goals,notes,assessments}, primaryUserId }
+ * Copy account-level setup from source to destination and build source→destination id maps
+ * (tags, statuses, outcomes, meeting types, templates). Existing destination items with the same
+ * name are reused, never duplicated. Types not selected are still matched so client records can map to them.
+ */
+async function tenantAccountSetup({ types = [], userMap } = {}) {
+  const want = new Set(types);
+  const out = { counts: {}, warnings: [], errors: [] };
+  const maps = { tags: {}, statuses: {}, outcomes: {}, meetingTypes: {}, initiativeTemplates: {}, goalTemplates: {}, deliverableTemplates: {} };
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  const bump = (type, key) => { out.counts[type] = out.counts[type] || { created: 0, skipped: 0, failed: 0 }; out.counts[type][key]++; };
+  const own = (x) => (x.scope || 'Account') !== 'Application';
+  const mapUser = (id) => (id && userMap?.byId?.[id]) || null;
+  const LABELS = {
+    tags: 'Tag', statuses: 'Initiative status', outcomes: 'Goal outcome', meetingTypes: 'Meeting type', meetingTemplates: 'Meeting template',
+    taskTemplates: 'Task template', initiativeTemplates: 'Initiative template', goalTemplates: 'Goal template',
+    agreementTemplates: 'Agreement template', deliverableTemplates: 'Deliverable template', roadmapTemplates: 'Roadmap template',
+  };
+  // Match every source row to a destination row by name; create the missing ones when the type is selected.
+  async function sync(type, srcRows, dstRows, { keyOf, srcId, dstId, create, mapName, creatable = () => true }) {
+    const byKey = new Map(dstRows.map((d) => [norm(keyOf(d)), dstId(d)]));
+    for (const s of srcRows) {
+      const k = norm(keyOf(s));
+      if (!k) continue;
+      let id = byKey.get(k);
+      if (id) { if (want.has(type) && creatable(s)) bump(type, 'skipped'); }
+      else if (want.has(type) && creatable(s)) {
+        try { id = await create(s); if (id) byKey.set(k, id); bump(type, 'created'); }
+        catch (error) { bump(type, 'failed'); out.errors.push(LABELS[type] + ' "' + keyOf(s) + '": ' + error.message); }
+        await sleep(100);
+      }
+      if (id && mapName) maps[mapName][srcId(s)] = id;
+    }
+  }
+  const step = async (type, fn) => { try { await fn(); } catch (error) { out.errors.push(LABELS[type] + 's: ' + error.message); } };
+
+  await step('tags', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/app/v1/tags'), tenantList('dest', '/app/v1/tags')]);
+    await sync('tags', s, d, { keyOf: (t) => t.name, srcId: (t) => t.tag_id, dstId: (t) => t.tag_id, mapName: 'tags',
+      create: async (t) => {
+        let id = null;
+        for (const domain of t.domains?.length ? t.domains : ['Initiative']) {
+          const r = await tenantFetch('dest', '/app/v1/tags', { method: 'POST', body: { tag: { name: t.name, color: t.color || 'Primary500', domain } } });
+          id = id || r?.tag_id;
+        }
+        return id;
+      } });
+  });
+
+  await step('statuses', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/initiatives/statuses/labels'), tenantList('dest', '/cs/v1/initiatives/statuses/labels')]);
+    const labelOf = (x) => x.custom_label || x.default_label || x.status;
+    for (const x of s.filter((x) => !x.is_custom)) maps.statuses[x.initiative_status_id] = x.initiative_status_id;
+    await sync('statuses', s.filter((x) => x.is_custom), d, { keyOf: labelOf, srcId: (x) => x.initiative_status_id, dstId: (x) => x.initiative_status_id, mapName: 'statuses',
+      create: async (x) => (await tenantFetch('dest', '/cs/v1/initiatives/statuses/custom', { method: 'POST', body: { label: labelOf(x), base_status: x.base_status } }))?.data?.initiative_status_id });
+    if (want.has('statuses')) {
+      for (const x of s.filter((x) => !x.is_custom && x.custom_label)) {
+        const dx = d.find((y) => y.initiative_status_id === x.initiative_status_id);
+        if (dx && dx.custom_label === x.custom_label) continue;
+        await attempt(out.warnings, 'Status label "' + x.custom_label + '"', () => tenantFetch('dest', '/cs/v1/initiatives/statuses/' + encodeURIComponent(x.initiative_status_id) + '/label', { method: 'PUT', body: { custom_label: x.custom_label } }));
+      }
+    }
+  });
+
+  await step('outcomes', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/goals/outcomes?visibility=all'), tenantList('dest', '/cs/v1/goals/outcomes?visibility=all')]);
+    await sync('outcomes', s, d, { keyOf: (o) => o.label, srcId: (o) => o.outcome_id, dstId: (o) => o.outcome_id, mapName: 'outcomes', creatable: (o) => own(o) && !o.is_archived,
+      create: async (o) => (await tenantFetch('dest', '/cs/v1/goals/outcomes', { method: 'POST', body: { label: o.label, description: o.description || null, group_key: o.group_key || null } }))?.outcome_id });
+  });
+
+  await step('meetingTypes', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/meeting-types'), tenantList('dest', '/cs/v1/meeting-types')]);
+    await sync('meetingTypes', s, d, { keyOf: (t) => t.label, srcId: (t) => t.meeting_type_id, dstId: (t) => t.meeting_type_id, mapName: 'meetingTypes',
+      create: async (t) => (await tenantFetch('dest', '/cs/v1/meeting-types', { method: 'POST', body: { label: t.label } }))?.meeting_type_id });
+  });
+
+  await step('meetingTemplates', async () => {
+    if (!want.has('meetingTemplates')) return;
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/meeting-templates'), tenantList('dest', '/cs/v1/meeting-templates')]);
+    await sync('meetingTemplates', s, d, { keyOf: (t) => t.title, srcId: (t) => t.meeting_template_id, dstId: (t) => t.meeting_template_id,
+      create: async (t) => {
+        const typeId = maps.meetingTypes[t.meeting_type?.meeting_type_id];
+        if (!typeId) throw new Error('its meeting type "' + (t.meeting_type?.label || '?') + '" is missing in the destination; include Meeting types.');
+        return (await tenantFetch('dest', '/cs/v1/meeting-templates', { method: 'POST', body: {
+          title: t.title, meeting_type_id: typeId, agenda_json: t.agenda_json || null,
+          assigned_user_ids: (t.assigned_user_ids || []).map(mapUser).filter(Boolean),
+        } }))?.meeting_template_id;
+      } });
+  });
+
+  await step('taskTemplates', async () => {
+    if (!want.has('taskTemplates')) return;
+    const [s, d] = await Promise.all([tenantList('source', '/app/v1/task-templates'), tenantList('dest', '/app/v1/task-templates')]);
+    await sync('taskTemplates', s, d, { keyOf: (t) => t.title, srcId: (t) => t.task_template_id, dstId: (t) => t.task_template_id, creatable: own,
+      create: async (t) => (await tenantFetch('dest', '/app/v1/task-templates', { method: 'POST', body: { task_template: { title: t.title, description_json: t.description_json || null, category: t.category || null } } }))?.task_template_id });
+  });
+
+  await step('initiativeTemplates', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/initiative-templates'), tenantList('dest', '/cs/v1/initiative-templates')]);
+    await sync('initiativeTemplates', s, d, { keyOf: (t) => t.name, srcId: (t) => t.initiative_template_id, dstId: (t) => t.initiative_template_id, mapName: 'initiativeTemplates', creatable: own,
+      create: async (t) => {
+        const x = (await tenantFetch('source', '/cs/v1/initiative-templates/' + t.initiative_template_id))?.initiative_template || t;
+        return (await tenantFetch('dest', '/cs/v1/initiative-templates', { method: 'POST', body: { initiative_template: {
+          name: x.name, executive_summary_json: x.executive_summary_json || null, business_value_json: x.business_value_json || null,
+          budget_line_items: cleanLines(x.budget_line_items), recurring_line_items: cleanLines(x.recurring_line_items),
+          action_items: x.action_items || [], estimated_hours: x.estimated_hours || null,
+          tag_ids: (x.tags || []).map((g) => maps.tags[g.tag_id]).filter(Boolean),
+          budget_model: x.budget_model || null, cost_type: x.cost_type || null, recurrence: x.recurrence ?? null, duration: x.duration ?? null,
+        } } }))?.initiative_template_id;
+      } });
+  });
+
+  await step('goalTemplates', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/goal-templates'), tenantList('dest', '/cs/v1/goal-templates')]);
+    await sync('goalTemplates', s, d, { keyOf: (t) => t.title, srcId: (t) => t.goal_template_id, dstId: (t) => t.goal_template_id, mapName: 'goalTemplates', creatable: own,
+      create: async (t) => {
+        const x = (await tenantFetch('source', '/cs/v1/goal-templates/' + t.goal_template_id))?.goal_template || t;
+        const initIds = (x.initiative_templates || []).map((i) => maps.initiativeTemplates[i.initiative_template_id]).filter(Boolean);
+        if (!initIds.length) throw new Error('none of its initiative templates exist in the destination; include Initiative templates.');
+        return (await tenantFetch('dest', '/cs/v1/goal-templates', { method: 'POST', body: { goal_template: {
+          title: x.title, description: x.description || null, initiative_template_ids: initIds,
+          outcome_ids: (x.outcomes || []).map((o) => maps.outcomes[o.outcome_id]).filter(Boolean),
+        } } }))?.goal_template_id;
+      } });
+  });
+
+  await step('agreementTemplates', async () => {
+    if (!want.has('agreementTemplates')) return;
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/agreement-templates'), tenantList('dest', '/cs/v1/agreement-templates')]);
+    await sync('agreementTemplates', s, d, { keyOf: (t) => t.name_display || t.title, srcId: (t) => t.agreement_template_id, dstId: (t) => t.agreement_template_id, creatable: own,
+      create: async (t) => {
+        const x = (await tenantFetch('source', '/cs/v1/agreement-templates/' + t.agreement_template_id))?.agreement_template || t;
+        return (await tenantFetch('dest', '/cs/v1/agreement-templates', { method: 'POST', body: { agreement_template: {
+          name_display: x.name_display || x.title, title: x.title || x.name_display, impact: x.impact || 'Unspecified', status: x.status || 'Active',
+          billing_cycle: x.billing_cycle || 'Unknown', billing_cost_subunits: x.billing_cost_subunits || 0, billing_cost_type: x.billing_cost_type || 'Actual',
+          notify_days_before_end_date: x.notify_days_before_end_date ?? 30, category: x.category || null, description: x.description || null,
+          billing_number_of_seats: x.billing_number_of_seats == null ? null : Math.round(x.billing_number_of_seats),
+          billing_is_auto_renew: x.billing_is_auto_renew ?? null, is_third_party: x.is_third_party ?? null,
+        } } }))?.agreement_template_id;
+      } });
+  });
+
+  await step('deliverableTemplates', async () => {
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/deliverables/templates'), tenantList('dest', '/cs/v1/deliverables/templates')]);
+    await sync('deliverableTemplates', s, d, { keyOf: (t) => t.name, srcId: (t) => t.id, dstId: (t) => t.id, mapName: 'deliverableTemplates', creatable: (t) => t.is_custom !== false,
+      create: async (t) => {
+        const x = (await tenantFetch('source', '/cs/v1/deliverables/templates/' + t.id))?.deliverable_template || t;
+        let dropped = 0;
+        const sections = (x.sections || []).map((sec) => ({
+          section_key: sec.section_key, display_order: sec.display_order ?? 0, name: sec.name || null, summary: sec.summary || null,
+          include_cover_page: sec.include_cover_page ?? true, use_landscape_cover_page: !!sec.use_landscape_cover_page, include_exec_summary: sec.include_exec_summary ?? true,
+          // Vendor components point at the source tenant's integrations, which don't exist in the destination.
+          components: (sec.components || []).filter((c) => (c.component_type_configuration?.type === 'Vendor' ? (dropped++, false) : true)).map((c) => ({
+            component_key: c.component_key, component_type_configuration: { type: c.component_type_configuration?.type || 'LifecycleManager' },
+            configuration: c.configuration || null, display_order: c.display_order ?? null,
+          })),
+        }));
+        if (dropped) out.warnings.push('Deliverable template "' + x.name + '": ' + dropped + ' integration component(s) left out; re-add them in the destination.');
+        const r = await tenantFetch('dest', '/cs/v1/deliverables/templates', { method: 'POST', body: { name: x.name, description: x.description || null, sections } });
+        return r?.deliverable_template?.id;
+      } });
+  });
+
+  await step('roadmapTemplates', async () => {
+    if (!want.has('roadmapTemplates')) return;
+    const [s, d] = await Promise.all([tenantList('source', '/cs/v1/roadmap-templates'), tenantList('dest', '/cs/v1/roadmap-templates')]);
+    const owner = (o) => (o?.kind === 'user' && mapUser(o.user_id) ? { kind: 'user', user_id: mapUser(o.user_id) } : null);
+    await sync('roadmapTemplates', s, d, { keyOf: (t) => t.name, srcId: (t) => t.roadmap_template_id, dstId: (t) => t.roadmap_template_id, creatable: own,
+      create: async (t) => {
+        const x = (await tenantFetch('source', '/cs/v1/roadmap-templates/' + t.roadmap_template_id))?.roadmap_template || t;
+        const its = (x.initiative_templates || []).filter((i) => maps.initiativeTemplates[i.initiative_template_id]).map((i) => ({
+          initiative_template_id: maps.initiativeTemplates[i.initiative_template_id], target_quarter_offset: i.target_quarter_offset ?? null, default_owner: owner(i.default_owner),
+        }));
+        const manual = (x.manual_initiatives || []).map((m) => ({
+          id: m.id, position: m.position ?? 0, target_quarter_offset: m.target_quarter_offset ?? null, default_owner: owner(m.default_owner),
+          initiative_template: m.initiative_template ? { ...m.initiative_template, budget_line_items: cleanLines(m.initiative_template.budget_line_items), recurring_line_items: cleanLines(m.initiative_template.recurring_line_items), tag_ids: [], dependency_initiative_template_ids: [] } : null,
+        }));
+        if (!its.length && !manual.length) throw new Error('none of its initiatives exist in the destination; include Initiative templates.');
+        const r = await tenantFetch('dest', '/cs/v1/roadmap-templates', { method: 'POST', body: { roadmap_template: {
+          name: x.name, description_json: x.description_json || null, category: x.category || null, initiative_templates: its, manual_initiatives: manual,
+          goal_template_ids: (x.goal_template_ids || []).map((g) => maps.goalTemplates[g]).filter(Boolean),
+        } } });
+        return r?.roadmap_template_id;
+      } });
+  });
+
+  await chrome.storage.session.set({ [TENANT_MAPS_KEY]: maps });
+  return out;
+}
+
+/**
+ * Migrate one client. payload: { src:{id,name}, dst:{id,name}, objects:{initiatives,goals,notes,assessments,…}, primaryUserId }
  * Returns per-type counts, warnings, and errors. Never re-creates anything already in the ledger.
  */
 async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }) {
@@ -1030,9 +1241,21 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
     return primaryUserId || null;
   };
   const filt = (type) => '/lifecycle-manager/v1/' + type + '?filter%5Bclient.id%5D=' + encodeURIComponent(src.id);
+  const clientFilter = 'filter%5Bclient.id%5D=eq%3A' + encodeURIComponent(src.id);
   const bump = (type, key) => { out.counts[type] = out.counts[type] || { created: 0, skipped: 0, failed: 0 }; out.counts[type][key]++; };
   const initiativeMap = {};
   const goalMap = {};
+  // Destination id of any record copied for this client pair, in this run or an earlier one.
+  const dstOf = (type, srcId) => (srcId ? ledger[dst.id + '|' + type + '|' + srcId] || null : null);
+  const record = async (lk, id) => { ledger[lk] = id; await tenantRecord(lk, id); };
+  // Source user id -> destination user key, without warnings (attendees and assignees are optional).
+  const mapUserQuiet = (id, email) => {
+    if (sameTenant && id) return id;
+    return (id && userMap?.byId?.[id]) || (email && userMap?.byEmail?.[String(email).toLowerCase()]) || null;
+  };
+  // Account-level ids (tags, statuses, meeting types, templates) from the run's account setup step.
+  const { [TENANT_MAPS_KEY]: maps = {} } = sameTenant ? {} : await chrome.storage.session.get(TENANT_MAPS_KEY);
+  const mapId = (kind, id) => (!id ? null : sameTenant ? id : maps[kind]?.[id] || null);
 
   if (objects.initiatives) {
     const rows = await tenantPages('source', '/lifecycle-manager/v2/initiatives?filter%5Bclient.id%5D=eq%3A' + encodeURIComponent(src.id) + '&include_internal=true&include_unscheduled=true');
@@ -1047,11 +1270,11 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
           executive_summary_json: d.executive_summary_json || null,
         } });
         const id = created.id;
-        await tenantRecord(lk, id);
+        await record(lk, id);
         initiativeMap[it.id] = id;
         const w = [];
         const put = (label, path, body) => attempt(w, label, () => tenantFetch('dest', '/cs/v1/initiatives/' + id + path, { method: 'PUT', body }));
-        if (it.status) await put('Status', '/status', { status: it.status });
+        if (it.status) await put('Status', '/status', { status: mapId('statuses', it.status) || it.status });
         if (it.priority) await put('Priority', '/priority', { priority: it.priority });
         if (it.fiscal_quarter?.year) await put('Schedule', '/schedule', clampSchedule({ fiscal_quarter: { year: it.fiscal_quarter.year, quarter: it.fiscal_quarter.quarter } }).body);
         else if (it.target_start_date && it.target_end_date) await put('Schedule', '/schedule', clampSchedule({ target_start_date: it.target_start_date, target_end_date: it.target_end_date, target_precision: it.target_precision || 'Month' }).body);
@@ -1076,7 +1299,7 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
           client_key: { id: dst.id }, title: g.title, description: g.description || '', status: g.status || 'OnTrack', target_period: g.period || g.target_period || null,
         } });
         const id = created.id || created.goal_id;
-        await tenantRecord(lk, id);
+        await record(lk, id);
         goalMap[g.id] = id;
         bump('goals', 'created');
       } catch (error) { bump('goals', 'failed'); out.errors.push('Goal "' + g.title + '": ' + error.message); }
@@ -1091,7 +1314,7 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
       if (ledger[lk]) { bump('notes', 'skipped'); continue; }
       try {
         const created = await tenantFetch('dest', '/lifecycle-manager/v1/notes', { method: 'POST', body: { client_key: { id: dst.id }, title: n.title || 'Note', description_json: n.description_json || null } });
-        await tenantRecord(lk, created.id || created.note_id);
+        await record(lk, created.id || created.note_id);
         bump('notes', 'created');
       } catch (error) { bump('notes', 'failed'); out.errors.push('Note "' + (n.title || nid) + '": ' + error.message); }
       await sleep(120);
@@ -1114,7 +1337,7 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
           evaluate_user_id: evaluatorId, evaluate_at: a.evaluated_at || a.completed_at || new Date().toISOString(),
         } });
         const newId = created.id;
-        await tenantRecord(lk, newId);
+        await record(lk, newId);
         // Map answers by category + question title and criterion label.
         const inst = (await tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + newId))?.assessment || {};
         const norm = (s) => String(s || '').trim().toLowerCase();
@@ -1147,6 +1370,201 @@ async function tenantMigrateClient({ src, dst, objects, primaryUserId, userMap }
       } catch (error) { bump('assessments', 'failed'); out.errors.push('Assessment "' + a.title + '": ' + error.message); }
       await sleep(120);
     }
+  }
+
+  // ----- Phase 2 client records -----
+  const createdMeetings = [];
+
+  if (objects.meetings) {
+    for (const m of await tenantPages('source', '/cs/v1/meetings?' + clientFilter)) {
+      const lk = dst.id + '|meeting|' + m.id;
+      if (ledger[lk]) { bump('meetings', 'skipped'); continue; }
+      try {
+        const x = (await tenantFetch('source', '/cs/v1/meetings/' + m.id))?.meeting || m;
+        const owner = x.owned_by?.id || x.owned_by?.email ? (mapUserQuiet(x.owned_by.id, x.owned_by.email) || primaryUserId) : null;
+        const body = {
+          client_key: { id: dst.id }, title: x.title || 'Meeting', type: mapId('meetingTypes', x.meeting_type?.meeting_type_id),
+          starts_at: x.starts_at || null, ends_at: x.ends_at || null, agenda_json: x.agenda_json || null,
+          owned_by: owner ? { id: owner } : null,
+          user_attendee_keys: (x.user_attendee_ids || []).map((u) => mapUserQuiet(u, null)).filter(Boolean).map((id) => ({ id })),
+          contact_attendee_keys: (x.contact_attendees || []).filter((c) => !c.is_deleted).map((c) => (sameTenant ? { id: c.id } : c.email ? { email: c.email, client_key: { id: dst.id } } : null)).filter(Boolean),
+          external_attendees: (x.external_attendees || []).filter(Boolean),
+          outlook_linking_disabled: true, // copies must not create calendar events
+        };
+        let created;
+        try { created = await tenantFetch('dest', '/cs/v2/meetings', { method: 'POST', body }); }
+        catch (error) {
+          if (!body.contact_attendee_keys.length || !/-> (400|404|422)/.test(error.message)) throw error;
+          // Contacts come from each tenant's PSA; when one isn't in the destination, keep the meeting without them.
+          created = await tenantFetch('dest', '/cs/v2/meetings', { method: 'POST', body: { ...body, contact_attendee_keys: [] } });
+          out.warnings.push('Meeting "' + body.title + '" — client contacts not found in the destination; attendees left off.');
+        }
+        await record(lk, created.id);
+        createdMeetings.push([m.id, created.id]);
+        if (x.is_complete) await attempt(out.warnings, 'Meeting "' + body.title + '" complete', () => tenantFetch('dest', '/cs/v1/meetings/' + created.id + '/completion-status', { method: 'PUT', body: { is_completed: true } }));
+        bump('meetings', 'created');
+      } catch (error) { bump('meetings', 'failed'); out.errors.push('Meeting "' + (m.title || m.id) + '": ' + error.message); }
+      await sleep(120);
+    }
+    // Links from each new meeting to initiatives, goals and notes copied for this client.
+    for (const [srcM, dstM] of createdMeetings) {
+      const [inits, goals, notes] = await Promise.all([
+        tenantFetch('source', '/cs/v1/meetings/' + srcM + '/initiatives').catch(() => null),
+        tenantFetch('source', '/cs/v1/meetings/' + srcM + '/goals').catch(() => null),
+        tenantFetch('source', '/cs/v1/meetings/' + srcM + '/notes').catch(() => null),
+      ]);
+      for (const i of inits?.initiative_ids || []) { const d = dstOf('initiative', i); if (d) await attempt(out.warnings, 'Link meeting→initiative', () => tenantFetch('dest', '/cs/v1/meetings/' + dstM + '/initiatives/' + d, { method: 'POST' })); }
+      for (const g of goals?.goal_ids || []) { const d = dstOf('goal', g); if (d) await attempt(out.warnings, 'Link meeting→goal', () => tenantFetch('dest', '/cs/v1/meetings/' + dstM + '/goals/' + d, { method: 'POST' })); }
+      for (const n of notes?.data || []) { const d = dstOf('note', n.note_id); if (d) await attempt(out.warnings, 'Link meeting→note', () => tenantFetch('dest', '/cs/v1/meetings/' + dstM + '/notes/' + d, { method: 'POST' })); }
+    }
+  }
+
+  if (objects.tasks) {
+    for (const t of await tenantPages('source', '/app/v1/tasks?' + clientFilter)) {
+      const tid = t.engagement_action_id || t.id;
+      const lk = dst.id + '|task|' + tid;
+      if (ledger[lk]) { bump('tasks', 'skipped'); continue; }
+      try {
+        // Assignees first, then the task's creator, then the default assigned user.
+        let assignees = (t.assigned_user_ids || []).map((u) => mapUserQuiet(u, null)).filter(Boolean);
+        if (!assignees.length && t.created_by_user_id) assignees = [mapUserQuiet(t.created_by_user_id, null)].filter(Boolean);
+        if (!assignees.length && primaryUserId) assignees = [primaryUserId];
+        const created = await tenantFetch('dest', '/app/v1/tasks', { method: 'POST', body: {
+          client_key: { id: dst.id }, title: t.title || 'Task', description_json: t.description_json || null,
+          assigned_user_ids: assignees.map((id) => ({ id })), due_at: t.due_at || null,
+        } });
+        const id = created.id;
+        await record(lk, id);
+        const w = [];
+        if (t.is_completed) await attempt(w, 'Completed', () => tenantFetch('dest', '/app/v1/tasks/' + id + '/completion-status', { method: 'PUT', body: { is_completed: true } }));
+        if (t.is_pinned) await attempt(w, 'Pinned', () => tenantFetch('dest', '/app/v1/tasks/' + id + '/pin', { method: 'PUT', body: { is_pinned: true } }));
+        const li = dstOf('initiative', t.initiative_links?.initiative_id);
+        if (li) await attempt(w, 'Link to initiative', () => tenantFetch('dest', '/cs/v1/initiatives/' + li + '/tasks/' + id, { method: 'POST' }));
+        for (const g of t.goal_links || []) { const d = dstOf('goal', g.goal_id); if (d) await attempt(w, 'Link to goal', () => tenantFetch('dest', '/cs/v1/goals/' + d + '/tasks/' + id, { method: 'POST' })); }
+        for (const ml of t.meeting_links || []) { const d = dstOf('meeting', ml.meeting_id); if (d) await attempt(w, 'Link to meeting', () => tenantFetch('dest', '/cs/v1/meetings/' + d + '/tasks/' + id, { method: 'POST' })); }
+        for (const x of w) out.warnings.push('Task "' + t.title + '" — ' + x);
+        bump('tasks', 'created');
+      } catch (error) { bump('tasks', 'failed'); out.errors.push('Task "' + (t.title || tid) + '": ' + error.message); }
+      await sleep(120);
+    }
+  }
+
+  if (objects.agreements) {
+    let synced = 0;
+    for (const a of await tenantPages('source', '/cs/v1/agreements?' + clientFilter)) {
+      // PSA-synced agreements arrive through the destination's own PSA sync; only manual ones are copied.
+      if (a.source && a.source !== 'Manual') { synced++; continue; }
+      const lk = dst.id + '|agreement|' + a.id;
+      if (ledger[lk]) { bump('agreements', 'skipped'); continue; }
+      try {
+        const x = (await tenantFetch('source', '/cs/v1/agreements/' + a.id))?.agreement || a;
+        const created = await tenantFetch('dest', '/cs/v1/agreements', { method: 'POST', body: { client_key: { id: dst.id }, create_payload: {
+          title: x.name, category: x.category || null, impact: x.impact || 'Unspecified', status: x.status || 'Active', location: x.location || null,
+          description: x.description || null, is_third_party: x.is_third_party ?? null, billing_cycle: x.billing_cycle || 'Unknown',
+          billing_cost_subunits: x.billing_cost_subunits ?? 0, billing_cost_currency_code: x.billing_cost_currency_code || x.currency_code || null,
+          billing_cost_type: x.billing_cost_type || 'Actual', billing_per_seat_cost_subunits: x.billing_per_seat_cost_subunits ?? null,
+          billing_number_of_seats: x.billing_number_of_seats ?? null, billing_start_at: x.start_at || null, billing_is_auto_renew: x.is_auto_renew ?? null,
+          end_at: x.end_at || null, should_budget_past_end_date: !!x.should_budget_past_end_date, notify_days_before_end_date: x.notify_days_before_end_date ?? 30,
+          is_billable: !!x.is_billable,
+        } } });
+        const id = created.agreement_id || created.id;
+        await record(lk, id);
+        // Creating an agreement may add its own first line item; skip source items already present by name.
+        const have = new Set(((await tenantFetch('dest', '/cs/v1/agreements/' + id).catch(() => null))?.agreement?.line_items || []).map((l) => String(l.name || '').trim().toLowerCase()));
+        const cents = (v) => (v == null ? null : Math.round(Number(v) * 100));
+        for (const li of x.line_items || []) {
+          if (have.has(String(li.name || '').trim().toLowerCase())) continue;
+          await attempt(out.warnings, 'Agreement "' + x.name + '" item "' + li.name + '"', () => tenantFetch('dest', '/cs/v1/agreements/' + id + '/items', { method: 'POST', body: { agreement_item: {
+            name: li.name || x.name, description: li.description || null, start_at: li.start_at || null, end_at: li.end_at || null,
+            total_price_subunits: cents(li.total_price) ?? 0, unit_price_subunits: cents(li.unit_price), quantity: li.quantity ?? null,
+            price_type: li.price_type || 'Actual', is_billable: !!li.is_billable,
+          } } }));
+        }
+        if (x.assets?.length) out.warnings.push('Agreement "' + x.name + '" — ' + x.assets.length + ' linked device(s) not carried over; attach them in the destination.');
+        bump('agreements', 'created');
+      } catch (error) { bump('agreements', 'failed'); out.errors.push('Agreement "' + (a.name || a.id) + '": ' + error.message); }
+      await sleep(120);
+    }
+    if (synced) out.warnings.push(synced + ' PSA-synced agreement(s) skipped: they come from the destination\'s own PSA sync.');
+  }
+
+  if (objects.deliverables) {
+    let custom = 0;
+    for (const dv of await tenantPages('source', '/cs/v1/deliverables?' + clientFilter)) {
+      const lk = dst.id + '|deliverable|' + dv.id;
+      if (ledger[lk]) { bump('deliverables', 'skipped'); continue; }
+      const tpl = mapId('deliverableTemplates', dv.template_id);
+      if (!tpl) { custom++; continue; }
+      try {
+        const r = await tenantFetch('dest', '/cs/v1/clients/' + encodeURIComponent(dst.id) + '/deliverables/create-from/template/' + encodeURIComponent(tpl), { method: 'POST', body: { name: dv.name || null } });
+        await record(lk, r?.deliverable?.id || 'created');
+        if (r?.omitted_component_keys?.length) out.warnings.push('Deliverable "' + dv.name + '" — ' + r.omitted_component_keys.length + ' integration section(s) skipped (integration not set up for this client).');
+        bump('deliverables', 'created');
+      } catch (error) { bump('deliverables', 'failed'); out.errors.push('Deliverable "' + (dv.name || dv.id) + '": ' + error.message); }
+      await sleep(150);
+    }
+    if (custom) out.warnings.push(custom + ' deliverable(s) without a matching template were not rebuilt (their content is generated from live data).');
+  }
+
+  if (objects.extras) {
+    const srcInits = await tenantPages('source', '/lifecycle-manager/v2/initiatives?filter%5Bclient.id%5D=eq%3A' + encodeURIComponent(src.id) + '&include_internal=true&include_unscheduled=true');
+    const destAssessments = {}; // dst assessment id -> Map(question title -> question id)
+    for (const it of srcInits) {
+      const dInit = dstOf('initiative', it.id);
+      const lk = dst.id + '|initiative-extras|' + it.id;
+      if (!dInit) continue;
+      if (ledger[lk]) { bump('initiative extras', 'skipped'); continue; }
+      const w = [];
+      const d = (await tenantFetch('source', '/cs/v1/initiatives/' + it.id).catch(() => null))?.initiative || {};
+      const tagIds = (d.tag_ids || d.tags || it.tag_ids || it.tags || []).map((g) => mapId('tags', g.tag_id || g.id || g)).filter(Boolean);
+      if (tagIds.length) await attempt(w, 'Tags', () => tenantFetch('dest', '/cs/v1/initiatives/' + dInit + '/tags/assign', { method: 'PUT', body: { initiative_tag_ids: tagIds } }));
+      for (const u of (await tenantFetch('source', '/cs/v1/initiatives/' + it.id + '/external-urls').catch(() => null))?.data || []) {
+        await attempt(w, 'Link "' + u.label + '"', () => tenantFetch('dest', '/cs/v1/initiatives/' + dInit + '/external-urls', { method: 'POST', body: { url: u.url, label: u.label || u.url } }));
+      }
+      for (const f of (await tenantFetch('source', '/cs/v1/initiatives/' + it.id + '/attachments').catch(() => null))?.data || []) {
+        await attempt(w, 'File "' + f.file_name + '"', async () => {
+          const blob = await (await tenantRaw('source', '/cs/v1/initiatives/' + it.id + '/attachments/' + f.initiative_attachment_id + '/content')).blob();
+          const form = new FormData();
+          form.append('file', blob, f.file_name);
+          await tenantRaw('dest', '/cs/v1/initiatives/' + dInit + '/attachments', { method: 'POST', body: form });
+        });
+      }
+      // Assessment findings linked to this initiative, matched by question title in the copied assessment.
+      const qs = (await tenantFetch('source', '/cs/v1/initiatives/' + it.id + '/assessment-questions').catch(() => null))?.data || [];
+      const byAssessment = {};
+      for (const q of qs) {
+        const dA = dstOf('assessment', q.assessment_evaluation_id);
+        if (!dA) continue;
+        if (!destAssessments[dA]) {
+          const inst = (await tenantFetch('dest', '/lifecycle-manager/v1/assessments/' + dA).catch(() => null))?.assessment || {};
+          destAssessments[dA] = new Map();
+          for (const c of inst.category_list || []) for (const qq of c.question_list || []) destAssessments[dA].set(String(qq.title || '').trim().toLowerCase(), qq.assessment_question_id);
+        }
+        const dq = destAssessments[dA].get(String(q.title || '').trim().toLowerCase());
+        if (dq) (byAssessment[dA] = byAssessment[dA] || []).push(dq);
+      }
+      for (const [dA, ids] of Object.entries(byAssessment)) {
+        await attempt(w, 'Assessment findings', () => tenantFetch('dest', '/cs/v1/assessments/' + dA + '/questions/initiative-link', { method: 'POST', body: { initiative_id: dInit, assessment_evaluation_question_ids: ids } }));
+      }
+      await record(lk, dInit);
+      for (const x of w) out.warnings.push(it.name + ' — ' + x);
+      bump('initiative extras', 'created');
+      await sleep(120);
+    }
+  }
+
+  if (objects.clientTags) {
+    try {
+      const [s, d] = await Promise.all([tenantFetch('source', '/app/v1/clients/' + src.id), tenantFetch('dest', '/app/v1/clients/' + dst.id)]);
+      const tagsOf = (r) => ((r?.client || r)?.tags || []).map((g) => g.tag_id || g.id || g);
+      const want = tagsOf(s).map((id) => mapId('tags', id)).filter(Boolean);
+      const have = tagsOf(d);
+      const merged = [...new Set([...have, ...want])];
+      if (merged.length > have.length) {
+        await tenantFetch('dest', '/app/v1/clients/' + dst.id + '/tags', { method: 'PUT', body: { tag_ids: merged } });
+        bump('client tags', 'created');
+      } else bump('client tags', 'skipped');
+    } catch (error) { bump('client tags', 'failed'); out.errors.push('Client tags: ' + error.message); }
   }
 
   // Goal → initiative links (both sides must have migrated).
@@ -1209,6 +1627,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return sendResponse({ ok: true, data: { source: await tenantClients('source'), dest: await tenantClients('dest') } });
         case 'TENANT_USER_MATCH':
           return sendResponse({ ok: true, data: await tenantUserMatch() });
+        case 'TENANT_ACCOUNT_SETUP':
+          return sendResponse({ ok: true, data: await tenantAccountSetup(message.payload || {}) });
         case 'TENANT_MIGRATE_CLIENT':
           return sendResponse({ ok: true, data: await tenantMigrateClient(message.payload) });
         case 'CLEANUP_LIST_ACCOUNT_ITEMS':
