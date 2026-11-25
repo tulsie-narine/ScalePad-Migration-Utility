@@ -1989,9 +1989,15 @@ function renderPropel(source) {
   );
 
   const steps = propelStepsOpen();
-  if (ready && steps.templates === false && steps.clients !== false && clientState().companies) {
+  // Only one action bar fits, so pick the step the user is actually working in.
+  // Step 2 wins whenever a migration is running or clients are picked; otherwise Step 1
+  // keeps the bar while it has a selection to act on. An expanded Step 1 can no longer
+  // hide the Migrate button while the client list is on screen.
+  const clientsBar = ready && steps.clients !== false && !!clientState().companies;
+  const templatesBar = ready && steps.templates !== false && !!active.list;
+  if (clientsBar && (runState().running || clientState().selected.size || !templatesBar || !active.selected.size)) {
     mountActionBar(clientActionBar());
-  } else if (ready && active.list && steps.templates !== false) {
+  } else if (templatesBar) {
     const count = active.selected.size;
     const noun = tab === 'projects' ? 'Initiative Template' : 'Template';
     mountActionBar(h('div', { class: 'action-bar' },
