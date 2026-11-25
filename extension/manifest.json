@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ScalePad Migration Utility",
-  "version": "1.0.73",
+  "version": "1.0.74",
   "description": "A browser-side workspace for migrating data from other platforms into ScalePad products.",
   "action": {
     "default_title": "Open ScalePad Migration Utility"
