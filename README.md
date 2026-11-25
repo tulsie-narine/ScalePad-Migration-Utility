@@ -131,7 +131,9 @@ The utility reads the templates from your current tool and shows them in a list.
    - **Roadmap:** has items or empty. Click **Count roadmap items** for exact counts.
    - **Strategic Advisor:** show only one vCIO's clients.
    - **Include incomplete** audits or reviews. These come across with the answers so far and stay open in ScalePad CS.
-4. Tick **Assessments** and/or **Roadmap** for each client (or **Select all**) and click **Migrate**.
+4. Tick **Assessments** and/or **Roadmap** for each client (or **Select all**).
+5. Click **Dry run** first if you want to see what would happen. It makes the same reads as a real run but writes nothing, then shows per client how many items would be **created**, **updated** or **skipped** as already migrated, along with any templates that would be created and any client with no match or no audits in range. Export it as CSV to check before committing. Your selection is kept, so **Migrate** follows straight on.
+6. Click **Migrate**.
 
 <br clear="right">
 

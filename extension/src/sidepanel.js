@@ -2335,6 +2335,7 @@ function renderClientDataStep(templatesReady) {
 
   return h('div', {},
     renderRunPanel(),
+    renderPreviewPanel(),
     !templatesReady ? h('div', { class: 'callout callout-info', style: 'margin:0 0 12px' }, icon('alert'),
       h('div', { text: 'Create the ' + (eng().projectTemplates ? 'questionnaire and project templates' : eng().questionnaires) + ' in Step 1 before migrating client data.' })) : '',
     h('div', { class: 'seg seg-3', role: 'tablist', 'aria-label': 'Match status' },
@@ -2484,13 +2485,19 @@ function clientActionBar() {
     button = h('button', { class: 'btn btn-primary', type: 'button', disabled: !c.selected.size || !isConnected(), onclick: startClientMigration },
       c.selected.size ? 'Migrate ' + c.selected.size + ' Client' + (c.selected.size === 1 ? '' : 's') : 'Migrate Clients');
   }
+  // A rehearsal before the one-way part: same reads, no writes.
+  const preview = previewState();
+  const dryRun = !run.running && c.selected.size
+    ? h('button', { class: 'btn btn-secondary', type: 'button', disabled: !isConnected() || preview.running, onclick: previewClientMigration },
+      preview.running ? 'Checking…' : 'Dry run')
+    : '';
   return h('div', { class: 'action-bar' },
     h('span', { class: 'count' },
       run.running ? h('strong', { text: run.done + ' / ' + run.items.length }) : h('strong', { text: String(c.selected.size) }),
       run.running ? ' clients done' : ' clients',
       run.running ? h('small', { class: 'bar-sub', text: run.paused ? 'Paused' : run.phase })
         : c.selected.size ? h('small', { class: 'bar-sub', text: assess + ' assessments · ' + road + ' roadmaps' }) : ''),
-    button);
+    dryRun ? h('div', { style: 'display:flex; gap:8px' }, dryRun, button) : button);
 }
 
 function renderRunPanel() {
@@ -2558,6 +2565,126 @@ function renderOutcomeCard(i) {
       h('summary', {}, h('span', { text: 'Handled automatically' }), h('span', { class: 'note-count', text: String(autoCount) })),
       ...g.auto.map((grp) => h('div', { class: 'auto-group' }, h('strong', { text: grp.group + ' · ' + grp.entries.length }),
         h('p', { text: [...new Set(grp.entries.map((e) => e.subject || e.detail))].slice(0, 12).join(', ') + (grp.entries.length > 12 ? ', …' : '') })))) : '');
+}
+
+function previewState() {
+  if (!state.propelPreview) state.propelPreview = { running: false, rows: [], done: 0, total: 0, error: null, engineId: null };
+  return state.propelPreview;
+}
+
+/**
+ * Read-only rehearsal of the selected clients: the same source reads the real run makes,
+ * classified against the ledger and ScalePad, with nothing written. The selection is left
+ * intact so Migrate can follow straight after.
+ */
+async function previewClientMigration() {
+  const c = clientState();
+  const picks = [...c.selected.entries()];
+  if (!picks.length) return;
+  const engine = eng();
+  const source = sourceById(engine.id);
+  const p = previewState();
+  Object.assign(p, { running: true, rows: [], done: 0, total: picks.length, error: null, engineId: engine.id });
+  renderPropel(source);
+
+  const initTpls = await send({ type: 'LIST_INITIATIVE_TEMPLATE_NAMES' });
+  const initTemplates = new Set((initTpls.data || []).map((t) => t.name.trim().toLowerCase()));
+  try {
+    for (const [companyId, sel] of picks) {
+      const co = c.companies.find((x) => x.id === companyId);
+      const m = c.matches.get(companyId);
+      const row = { name: co?.name || companyId, client: m?.clientName || '', create: 0, update: 0, skip: 0, initiatives: 0, assessments: 0, notes: [] };
+      if (!m?.clientId) {
+        row.notes.push('No ScalePad CS client is matched, so this company would be skipped.');
+        p.rows.push(row);
+        p.done++;
+        renderPropel(source);
+        continue;
+      }
+      let projects = [];
+      let audits = [];
+      if (sel.roadmap) {
+        const res = await runInPropel({ mode: 'companyProjects', companyId });
+        if (!res.ok) row.notes.push('Roadmap could not be read: ' + res.error);
+        else {
+          projects = engine.adaptProjects ? await engine.adaptProjects(res.projects) : res.projects;
+          const missing = [...new Set(projects.map((x) => x.templateName).filter(Boolean))].filter((n) => !initTemplates.has(n.trim().toLowerCase()));
+          if (missing.length) row.notes.push(missing.length + ' initiative template' + (missing.length === 1 ? '' : 's') + ' would be created: ' + missing.slice(0, 3).join(', ') + (missing.length > 3 ? '…' : ''));
+        }
+      }
+      if (sel.assessments) {
+        const res = await runInPropel({ mode: 'companyAudits', companyId, includeIncomplete: !!sel.includeIncomplete });
+        if (!res.ok) row.notes.push(cap(engine.audits) + ' could not be read: ' + res.error);
+        else {
+          audits = window.Propel.pickAuditsToMigrate(res.audits, sel.auditRange || 'latest');
+          if (!audits.length) row.notes.push('No ' + engine.audits + ' in the selected date range.');
+        }
+      }
+      const pf = await send({ type: 'PREFLIGHT_CLIENT', payload: {
+        client: { id: m.clientId, name: m.clientName },
+        projects: projects.map((x) => ({ id: x.id, name: x.name })),
+        audits: audits.map((x) => ({ id: x.id, name: x.name })),
+      } });
+      if (!pf.ok) row.notes.push(pf.error || 'Could not check this client against ScalePad CS.');
+      else {
+        row.initiatives = pf.data.projects.length;
+        row.assessments = pf.data.audits.length;
+        for (const entry of [...pf.data.projects, ...pf.data.audits]) {
+          if (entry.action === 'create') row.create++;
+          else if (entry.action === 'skip') row.skip++;
+          else row.update++;
+        }
+      }
+      p.rows.push(row);
+      p.done++;
+      renderPropel(source);
+    }
+  } catch (error) {
+    p.error = error.message;
+  }
+  p.running = false;
+  renderPropel(source);
+}
+
+function previewTotals(rows) {
+  return rows.reduce((t, r) => ({
+    create: t.create + r.create, update: t.update + r.update, skip: t.skip + r.skip,
+    initiatives: t.initiatives + r.initiatives, assessments: t.assessments + r.assessments,
+  }), { create: 0, update: 0, skip: 0, initiatives: 0, assessments: 0 });
+}
+
+function renderPreviewPanel() {
+  const p = previewState();
+  if (!p.rows.length && !p.running && !p.error) return '';
+  if (p.engineId && p.engineId !== eng().id) return '';
+  const t = previewTotals(p.rows);
+  const close = h('button', { class: 'link-btn', type: 'button', onclick: () => { state.propelPreview = null; renderPropel(sourceById(eng().id)); } }, 'Close');
+  return h('div', { class: 'callout callout-info', style: 'margin:0 0 12px; display:block' },
+    h('div', { class: 'review-toolbar' },
+      h('h2', { text: p.running ? 'Checking ' + p.done + ' of ' + p.total + '…' : 'Dry run — nothing was written' }),
+      p.running ? '' : close),
+    h('p', { class: 'muted small', text: t.create + ' to create · ' + t.update + ' to update · ' + t.skip + ' already migrated (' + t.initiatives + ' initiatives, ' + t.assessments + ' assessments across ' + p.rows.length + ' client' + (p.rows.length === 1 ? '' : 's') + ')' }),
+    p.error ? h('p', { class: 'muted small', text: p.error }) : '',
+    h('div', { class: 'client-list', style: 'margin-top:8px' }, ...p.rows.map((r) => h('div', { class: 'review-item' },
+      h('span', { class: 'review-main' },
+        h('strong', { text: r.name }),
+        h('small', { text: r.create + ' create · ' + r.update + ' update · ' + r.skip + ' skip' + (r.client ? ' → ' + r.client : '') })),
+      ...r.notes.map((n) => h('small', { class: 'field-help', text: n }))))),
+    p.running || !p.rows.length ? '' : h('button', { class: 'link-btn', type: 'button', style: 'margin-top:8px', onclick: exportPreviewCsv }, 'Export dry run as CSV'));
+}
+
+function exportPreviewCsv() {
+  const p = previewState();
+  const rows = [['Company', 'ScalePad CS client', 'Create', 'Update', 'Already migrated', 'Initiatives', 'Assessments', 'Notes'],
+    ...p.rows.map((r) => [r.name, r.client, r.create, r.update, r.skip, r.initiatives, r.assessments, r.notes.join('; ')])];
+  const csv = rows.map((row) => row.map((v) => '"' + String(v ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+  const a = h('a', {
+    href: URL.createObjectURL(new Blob([csv], { type: 'text/csv' })),
+    download: 'migration-dry-run-' + new Date().toISOString().slice(0, 10) + '.csv',
+  });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 async function startClientMigration() {

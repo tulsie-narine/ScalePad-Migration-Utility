@@ -496,6 +496,33 @@ function forgetAdoptionCache() {
   adoptionCache.clear();
 }
 
+/**
+ * What a run would do for one client, writing nothing. Each item is classified against the
+ * same two sources of truth the real run uses: the local ledger first, then the live scan
+ * that catches work done from another machine.
+ */
+async function preflightClient({ client, projects = [], audits = [] }) {
+  const ledger = await propelLedger();
+  const index = await clientMigratedIndex(client.id);
+  const classify = {
+    project: (item) => {
+      const known = ledger.projects[item.id];
+      if (known) return known.needsRepair ? 'update' : 'skip';
+      const key = self.Propel.normName(item.name || '');
+      return key && index.initiatives.has(key) ? 'adopt' : 'create';
+    },
+    audit: (item) => {
+      const known = ledger.audits[item.id];
+      if (known) return known.needsRepair || known.incomplete ? 'update' : 'skip';
+      return index.assessments.has(migrationRef('audit', item.id)) ? 'adopt' : 'create';
+    },
+  };
+  return {
+    projects: projects.map((item) => ({ id: item.id, name: item.name, action: classify.project(item) })),
+    audits: audits.map((item) => ({ id: item.id, name: item.name, action: classify.audit(item) })),
+  };
+}
+
 async function migratePropelAudit({ audit, answers, client, templateId, evaluatorId }) {
   const ledger = await propelLedger();
   const warnings = [];
@@ -1732,6 +1759,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return sendResponse({ ok: true, data: await migratePropelProject(message.payload) });
         case 'LINK_PROPEL_FINDINGS':
           return sendResponse({ ok: true, data: await linkPropelFindings(message.payload) });
+        case 'PREFLIGHT_CLIENT':
+          return sendResponse({ ok: true, data: await preflightClient(message.payload) });
         case 'GET_PROPEL_LEDGER':
           return sendResponse({ ok: true, data: await propelLedger() });
         case 'IMPORT_PROPEL_LEDGER': {
