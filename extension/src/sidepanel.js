@@ -1477,7 +1477,50 @@ function renderSettings() {
     })),
   );
 
-  body.replaceChildren(apiCard, defaultsCard, accessCard);
+  // migration record (the ledger that stops a second run duplicating the first)
+  const ledgerCard = h('section', { class: 'card', 'aria-labelledby': 'ledgerTitle' },
+    h('h2', { id: 'ledgerTitle', class: 'card-title', text: 'Migration record' }),
+    h('p', { class: 'muted', text: 'What this browser has already migrated. Export it before running the same migration from another computer or Chrome profile, then import it there so nothing is created twice.' }),
+    h('div', { class: 'picker-actions', style: 'margin-top:10px' },
+      h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: exportLedger }, 'Export record'),
+      h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: importLedger }, 'Import record')),
+    h('span', { class: 'field-help', style: 'margin-top:8px', text: 'Items migrated on another machine are also detected automatically during a run, so importing is a shortcut, not a requirement.' }),
+  );
+
+  body.replaceChildren(apiCard, defaultsCard, accessCard, ledgerCard);
+}
+
+async function exportLedger() {
+  const res = await send({ type: 'GET_PROPEL_LEDGER' });
+  if (!res.ok) { showToast('Could not read the migration record.'); return; }
+  const counts = { audits: Object.keys(res.data?.audits || {}).length, projects: Object.keys(res.data?.projects || {}).length };
+  const payload = JSON.stringify({ kind: 'scalepad-migration-ledger', version: 1, exportedAt: new Date().toISOString(), ledger: res.data }, null, 2);
+  const a = h('a', {
+    href: URL.createObjectURL(new Blob([payload], { type: 'application/json' })),
+    download: 'scalepad-migration-record-' + new Date().toISOString().slice(0, 10) + '.json',
+  });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast('Exported ' + counts.audits + ' assessments and ' + counts.projects + ' initiatives.');
+}
+
+function importLedger() {
+  const picker = h('input', { type: 'file', accept: 'application/json,.json', style: 'display:none' });
+  picker.addEventListener('change', async () => {
+    const file = picker.files?.[0];
+    picker.remove();
+    if (!file) return;
+    let parsed;
+    try { parsed = JSON.parse(await file.text()); } catch (_e) { showToast('That file is not valid JSON.'); return; }
+    const ledger = parsed?.ledger || parsed;
+    const res = await send({ type: 'IMPORT_PROPEL_LEDGER', payload: { ledger } });
+    if (!res.ok) { showToast(res.error || 'Could not import that file.'); return; }
+    const { added, total } = res.data;
+    showToast('Added ' + (added.audits + added.projects) + ' new entries — now tracking ' + total.audits + ' assessments and ' + total.projects + ' initiatives.');
+  });
+  document.body.appendChild(picker);
+  picker.click();
 }
 
 function fillEvaluatorSelect(select) {

@@ -290,6 +290,8 @@ Every item is also collected in the **Migration issues** centre (the clipboard i
 
 **Re-running is safe.** Run the same client again and the utility skips what's already there and only repairs what had problems.
 
+**Running from more than one computer.** The record of what's been migrated is kept in the browser you ran it from. Starting a run on a second computer, in another Chrome profile, or after reinstalling the extension doesn't duplicate anything: before creating an assessment or initiative, the utility checks ScalePad CS for a copy an earlier run already made and updates that instead. The run summary says when this happens. To skip the check (and the time it takes), open **Settings › Migration record**, **Export record** on the first computer and **Import record** on the second.
+
 <br clear="right">
 
 ---

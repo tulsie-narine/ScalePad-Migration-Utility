@@ -443,6 +443,59 @@ async function attempt(warnings, label, fn) {
   }
 }
 
+// ---------- Cross-profile adoption ----------
+// The ledger lives in chrome.storage.local, so a run started on another machine, in another
+// Chrome profile, or after a reinstall begins with no memory of what was already migrated and
+// would create a second copy of everything. Before creating anything we look for a copy an
+// earlier run left behind: assessments carry a migration ref in their internal comment, and
+// initiatives are matched by name within the same client. Anything adopted is written back to
+// the local ledger, so this costs at most one scan per client per run.
+
+const MIGRATION_REF_LABEL = 'Migration ref: ';
+const ASSESSMENT_SUMMARY_MAX = 1000;
+const ADOPTION_TTL_MS = 15 * 60 * 1000;
+const ADOPTION_SCAN_CAP = 200;
+const adoptionCache = new Map();
+
+function migrationRef(kind, sourceId) {
+  return MIGRATION_REF_LABEL + kind + ':' + sourceId;
+}
+
+/** Append the ref to an assessment summary, keeping the whole thing inside ScalePad's limit. */
+function withMigrationRef(summary, ref) {
+  const tail = '\n\n' + ref;
+  const room = ASSESSMENT_SUMMARY_MAX - tail.length;
+  const head = String(summary || '');
+  return (head.length > room ? head.slice(0, room - 1).trimEnd() + '\u2026' : head) + tail;
+}
+
+/** Everything an earlier run already migrated for one client, by ref (assessments) and name (initiatives). */
+async function clientMigratedIndex(clientId) {
+  const cached = adoptionCache.get(clientId);
+  if (cached && Date.now() - cached.at < ADOPTION_TTL_MS) return cached.index;
+  const index = { assessments: new Map(), initiatives: new Map() };
+  try {
+    const ids = (await listClientRecords('assessments', clientId)).slice(0, ADOPTION_SCAN_CAP);
+    for (const id of ids) {
+      const comment = (await lmx.getAssessment(id).catch(() => null))?.assessment?.internal_comment || '';
+      const found = comment.match(/Migration ref: (\S+)/);
+      if (found && !index.assessments.has(found[1])) index.assessments.set(found[1], id);
+    }
+  } catch (_error) { /* best effort: a failed scan just means nothing is adopted */ }
+  try {
+    for (const initiative of await lmClientInitiatives(clientId)) {
+      const key = self.Propel.normName(initiative.name || '');
+      if (key && !index.initiatives.has(key)) index.initiatives.set(key, initiative.id);
+    }
+  } catch (_error) { /* ditto */ }
+  adoptionCache.set(clientId, { at: Date.now(), index });
+  return index;
+}
+
+function forgetAdoptionCache() {
+  adoptionCache.clear();
+}
+
 async function migratePropelAudit({ audit, answers, client, templateId, evaluatorId }) {
   const ledger = await propelLedger();
   const warnings = [];
@@ -472,6 +525,20 @@ async function migratePropelAudit({ audit, answers, client, templateId, evaluato
       if (instance.status === 'Completed') await attempt(warnings, 'Reopen', () => lmx.setCompletionStatus(assessmentId, false));
     }
   }
+  const ref = migrationRef('audit', audit.id);
+  if (!assessmentId) {
+    // No local ledger entry: an earlier run on another machine may still have migrated this audit.
+    const adoptedId = (await clientMigratedIndex(client.id)).assessments.get(ref);
+    const adopted = adoptedId ? (await lmx.getAssessment(adoptedId).catch(() => null))?.assessment : null;
+    if (adopted && !adopted.assessment_template_is_deleted) {
+      assessmentId = adoptedId;
+      instance = adopted;
+      repaired = true;
+      notes.push('An earlier run (on another browser or machine) already created this assessment, so it was updated instead of duplicated');
+      await recordPropelLedger('audits', audit.id, assessmentId);
+      if (adopted.status === 'Completed') await attempt(warnings, 'Reopen', () => lmx.setCompletionStatus(assessmentId, false));
+    }
+  }
   if (!assessmentId) {
     const created = await lmx.createAssessment(self.Propel.assessmentCreatePayload(audit, { clientId: client.id, clientName: client.name, templateId, evaluatorId }));
     assessmentId = created.id;
@@ -488,7 +555,8 @@ async function migratePropelAudit({ audit, answers, client, templateId, evaluato
       ? lmx.setQuestionPublicComment(assessmentId, c.questionId, c.text)
       : lmx.setQuestionInternalComment(assessmentId, c.questionId, c.text)));
   }
-  await attempt(warnings, 'Assessment summary', () => lmx.setAssessmentInternalComment(assessmentId, plan.summary));
+  // The ref is what lets a run from another profile find this assessment instead of duplicating it.
+  await attempt(warnings, 'Assessment summary', () => lmx.setAssessmentInternalComment(assessmentId, withMigrationRef(plan.summary, ref)));
   // In-progress Propel audits stay open in ScalePad so they can be finished there (or re-synced later).
   if (!audit.incomplete) await attempt(warnings, 'Mark complete', () => lmx.setCompletionStatus(assessmentId, true));
   else notes.push('Still in progress in ' + (String(audit.id).startsWith('mitp-') ? 'MyITProcess' : 'Propel') + ', so the assessment was left open');
@@ -538,6 +606,19 @@ async function migratePropelProject({ project, client, templateIdByName, rich, a
       await chrome.storage.local.set({ [PROPEL_LEDGER_KEY]: ledger });
       plan.notes.push({ kind: 'recreated', detail: 'The earlier copy was deleted in ScalePad CS, so it was created again' });
       existing = null;
+    }
+  }
+  if (!existing) {
+    // Same story as assessments: without a ledger entry, look for a copy an earlier run made.
+    // Matched on name within this client, since initiatives carry no ref of their own.
+    const key = self.Propel.normName(plan.create?.name || project.name || '');
+    const adoptedId = key ? (await clientMigratedIndex(client.id)).initiatives.get(key) : null;
+    if (adoptedId) {
+      // templateApplied is set so an initiative someone has been working on is never
+      // overwritten by re-applying its template; only the project's own fields are refreshed.
+      existing = { id: adoptedId, needsRepair: true, templateApplied: true };
+      await recordPropelLedger('projects', project.id, adoptedId, { templateApplied: true });
+      plan.notes.push({ kind: 'adopted', detail: 'An initiative with this name already existed for this client, so it was updated instead of duplicated' });
     }
   }
   if (existing) {
@@ -1653,6 +1734,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return sendResponse({ ok: true, data: await linkPropelFindings(message.payload) });
         case 'GET_PROPEL_LEDGER':
           return sendResponse({ ok: true, data: await propelLedger() });
+        case 'IMPORT_PROPEL_LEDGER': {
+          // Carry what one machine already migrated over to another, so a second operator
+          // picks up where the first left off instead of duplicating their work.
+          const incoming = message.payload?.ledger;
+          if (!incoming || typeof incoming !== 'object') throw new Error('That file is not a migration ledger.');
+          const current = await propelLedger();
+          const merged = { audits: { ...current.audits }, projects: { ...current.projects } };
+          const added = { audits: 0, projects: 0 };
+          for (const kind of ['audits', 'projects']) {
+            for (const [sourceId, entry] of Object.entries(incoming[kind] || {})) {
+              if (!entry?.id || merged[kind][sourceId]) continue; // a local entry is the fresher one
+              merged[kind][sourceId] = entry;
+              added[kind]++;
+            }
+          }
+          await chrome.storage.local.set({ [PROPEL_LEDGER_KEY]: merged });
+          forgetAdoptionCache();
+          return sendResponse({ ok: true, data: { added, total: { audits: Object.keys(merged.audits).length, projects: Object.keys(merged.projects).length } } });
+        }
         case 'LIST_SP_CLIENTS': {
           // All ScalePad clients with their PSA source ids, for Propel company matching.
           const clients = [];
